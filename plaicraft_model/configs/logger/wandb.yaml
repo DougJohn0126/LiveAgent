@@ -1,0 +1,14 @@
+wandb: # W&B logger config (native checkpoint artifact handling + validation-media ingestion)
+  _target_: src.utils.wandb_logger.CustomWandbLogger # Thin WandbLogger wrapper
+  name: ${task_name}  # Name will be set by experiment config
+  save_dir: ${paths.output_dir} # Output directory
+  offline: false # Offline mode
+  id: null  # Pass in run id to resume
+  anonymous: null # Enable anonymous logging
+  project: "plaicraft_plai_v1" # W&B project name
+  log_model: true  # Log model checkpoints to W&B
+  prefix: "" # Metric key prefix
+  entity: ${oc.env:WANDB_ENTITY,plaicraft-academic} # W&B entity/team
+  group: null  # Can be overridden per experiment
+  tags: ${tags} # Tag list
+  resume: null  # Options: "allow", "must", "never"

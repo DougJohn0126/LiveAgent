@@ -1,0 +1,6 @@
+defaults: # Inherit base trainer config
+  - default # Base trainer settings
+
+accelerator: mps # Apple Metal accelerator
+devices: 1 # Device count
+precision: 16-mixed  # Apple Silicon supports fp16 mixed precision

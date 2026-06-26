@@ -1,0 +1,8 @@
+# disable python warnings if they annoy you
+ignore_warnings: True # Disable Python warnings when true
+
+# ask user for tags if none are provided in the config
+enforce_tags: True # Require tags to be set
+
+# pretty print config tree at the start of the run using Rich library
+print_config: True # Print config tree at startup

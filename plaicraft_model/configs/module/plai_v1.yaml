@@ -1,0 +1,25 @@
+_target_: src.training.plai_v1_lightning_module.PlaiV1LightningModule # LightningModule class
+
+# LightningModule / optimization params (no model architecture here)
+model: ${model} # Model config reference
+noise_scheduler: ${noise_scheduler} # Noise scheduler config reference
+
+# Optimizer settings (values only - optimizer created based on strategy)
+learning_rate: 0.0001 # Base learning rate
+weight_decay: 0.01 # Weight decay
+
+# Learning rate scheduler settings (uses custom scheduler builder)
+lr_scheduler: "cosine_warmup"  # Options: none, constant, cosine, cosine_warmup, linear_warmup, poly, exponential
+lr_warmup_steps: 5000 # Warmup steps
+lr_warmup_pct: 0.03 # Warmup ratio
+lr_min_ratio: 0.1 # Minimum LR ratio
+lr_poly_power: 1.0 # Polynomial decay power
+lr_exp_gamma: 0.999 # Exponential decay gamma
+lr_total_steps: 300000 # Total steps for scheduler
+
+modality_loss_weights:
+  video: 1.0
+  audio_speak: 1.0
+  audio_hear: 1.0
+  key_press: 1.0
+  mouse_movement: 1.0

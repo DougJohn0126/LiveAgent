@@ -1,0 +1,6 @@
+defaults: # Inherit base trainer config
+  - default # Base trainer settings
+
+accelerator: gpu # GPU accelerator
+devices: 1 # GPU count
+precision: bf16-mixed # Mixed precision mode

@@ -1,0 +1,12 @@
+sync_validation:
+  _target_: src.utils.callbacks.sync_validation.SyncValidation
+  enabled: false
+  eval_config_name: eval
+  eval_overrides: []
+  every_n_train_steps: 10000
+  direct_scalar_logging: true
+  log_media: true
+  fail_on_error: false
+  start_index: null
+  stop_index: null
+  max_samples: null

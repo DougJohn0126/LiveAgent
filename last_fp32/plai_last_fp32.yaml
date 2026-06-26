@@ -1,0 +1,325 @@
+task_name: rope
+tags:
+- 1.7B
+- deepspeed_stage_2
+- trillium
+- high_quality_data
+- videorope
+- dataframe_level_casual_mask
+- normal_layout_video_coord
+train: true
+test: false
+ckpt_path: /scratch/charlie5/plaicraft-model-pi0/logs/rope/runs/2026-05-26_15-53-02/checkpoints/last.ckpt
+wandb_artifact_path: null
+seed: 42
+ds_universal: false
+ds_offload: false
+torch_dynamo:
+  optimize_ddp: false
+optimized_metric: null
+data:
+  _target_: src.data.datamodule.DataModule
+  dataset_path: ${oc.env:DATASET_PATH}
+  global_database_path: ${oc.env:GLOBAL_DATABASE_PATH}
+  validation_db_path: ${oc.env:VALIDATION_DATABASE_PATH,}
+  modalities:
+  - video
+  - audio_hear
+  - audio_speak
+  - key_press
+  - mouse_movement
+  window_length_frames: 300
+  hop_length_frames: 300
+  player_names: null
+  batch_size: 20
+  num_workers: 5
+  shuffle: true
+  target_length: 5
+  k_subsample_size: 100
+  stm_context_length: ${model.stm_context_length}
+noise_scheduler:
+  _target_: src.training.noise_schedulers.FlowMatchingScheduler
+  target_modalities: ${model.target_modalities}
+  sampling_type: uniform
+  p_mean: 0
+  p_std: 1
+  use_time_shift: false
+  base_dim: 4096
+model:
+  _target_: src.models.plai_v1.PlaiV1Model
+  h_dim: 1024
+  use_weightnorm: true
+  stm_context_length: 5
+  ltm_downsample_chunk_length: 5
+  context_modalities:
+  - video
+  - audio_hear
+  - audio_speak
+  - key_press
+  - mouse_movement
+  target_modalities:
+  - video
+  - audio_hear
+  - audio_speak
+  - key_press
+  - mouse_movement
+  ltm_drop_modalities: []
+  ltm_conditioning_mode: adaln
+  positional_encoding_type: rope
+  checkpointing:
+    perceiver: true
+    rnn: true
+    moe_decoder: false
+  multimodal_io:
+    _target_: src.models.components.multimodal_io.MultimodalIO
+    patch_h: 8
+    patch_w: 8
+    ltm_patch_h: 32
+    ltm_patch_w: 32
+    model_dim: ${..h_dim}
+    player_embed_dim: ${..h_dim}
+    stm_context_length: ${..stm_context_length}
+    ltm_downsample_chunk_length: ${..ltm_downsample_chunk_length}
+    context_modalities: ${..context_modalities}
+    target_modalities: ${..target_modalities}
+    ltm_drop_modalities: ${..ltm_drop_modalities}
+    mask_type: dataframe_level
+    name_vocab_size: 20000
+    gender_vocab_size: 5
+    skill_vocab_size: 5
+    positional_encoding_type: ${..positional_encoding_type}
+    fourier_num_bands: 64
+    fourier_concat_pos: true
+    fourier_sine_only: false
+    temporal_fourier_min_resolution: 0.1
+    temporal_fourier_max_resolution: 4.0
+    video_spatial_fourier_min_resolution:
+    - 0.02
+    - 0.0333
+    video_spatial_fourier_max_resolution:
+    - 0.12
+    - 0.2
+    trainable_pos_init_scale: 0.02
+    rope_temporal_scale_factor: 100.0
+    use_diagonal_layout_coord: false
+  context_embedder:
+    _target_: src.models.components.context_embedder.ContextEmbedder
+    model_dim: ${..h_dim}
+    use_weightnorm: ${..use_weightnorm}
+    ltm_num_latents: 32
+    ltm_perceiver_depth: 8
+    ltm_perceiver_cross_heads: 8
+    ltm_perceiver_latent_heads: 8
+    ltm_perceiver_cross_dim_head: 32
+    ltm_perceiver_latent_dim_head: 32
+    ltm_perceiver_seq_dropout: 0.0
+    stm_num_latents: 32
+    stm_perceiver_depth: 8
+    stm_perceiver_cross_heads: 4
+    stm_perceiver_latent_heads: 8
+    stm_perceiver_cross_dim_head: 64
+    stm_perceiver_latent_dim_head: 64
+    stm_perceiver_seq_dropout: 0.0
+    use_stm_perceiver: false
+    ltm_conditioning_mode: ${..ltm_conditioning_mode}
+    temporal_fourier_min_resolution: ${..multimodal_io.temporal_fourier_min_resolution}
+    temporal_fourier_max_resolution: ${..multimodal_io.temporal_fourier_max_resolution}
+    stm_fourier_num_bands: ${..multimodal_io.fourier_num_bands}
+    stm_context_length: ${..stm_context_length}
+    ltm_downsample_chunk_length: ${..ltm_downsample_chunk_length}
+    chunk_len: 0
+    k_ltm: 64
+    rnn_config:
+      rnn_type: mingru
+      embedding_dim: 2048
+      num_layers: 8
+      num_heads: 16
+      mlp_multiplier: 4
+      dropout: 0.0
+      num_blocks: 8
+      context_length: 8192
+      conv1d_kernel_size: 4
+      qkv_proj_blocksize: 4
+      slstm_at: []
+      mlstm_chunk_size: 64
+      chunkwise_kernel: chunkwise--triton_xl_chunk
+      sequence_kernel: native_sequence__triton
+      step_kernel: triton
+      backend_mode: train_with_padding
+  moe_decoder:
+    _target_: src.models.components.moe_decoder.MoEDecoder
+    embed_dim: ${..h_dim}
+    use_weightnorm: ${..use_weightnorm}
+    num_heads: 16
+    num_layers: 16
+    dropout: 0.0
+    use_cross_attention: true
+    ltm_conditioning_mode: ${..ltm_conditioning_mode}
+    positional_encoding_type: ${..positional_encoding_type}
+    rope_theta: 50000
+    rope_max_spatial_freq: 0.15
+    rope_mrope_section:
+    - 16
+    - 8
+    - 8
+    use_stm_perceiver: ${..context_embedder.use_stm_perceiver}
+    target_modalities: ${..target_modalities}
+    modality_configs:
+      video:
+        hidden_dim: 4096
+      audio_speak:
+        hidden_dim: 2048
+      audio_hear:
+        hidden_dim: 2048
+      key_press:
+        hidden_dim: 2048
+      mouse_movement:
+        hidden_dim: 2048
+module:
+  _target_: src.training.plai_v1_lightning_module.PlaiV1LightningModule
+  model: ${model}
+  noise_scheduler: ${noise_scheduler}
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  lr_scheduler: cosine_warmup
+  lr_warmup_steps: 5000
+  lr_warmup_pct: 0.03
+  lr_min_ratio: 0.1
+  lr_poly_power: 1.0
+  lr_exp_gamma: 0.999
+  lr_total_steps: 100000
+  modality_loss_weights:
+    video: 1.0
+    audio_speak: 1.0
+    audio_hear: 1.0
+    key_press: 1.0
+    mouse_movement: 1.0
+callbacks:
+  model_checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: epoch_{epoch:03d}_step_{step:07d}
+    monitor: train/total_loss
+    verbose: false
+    save_last: true
+    save_top_k: 1
+    mode: min
+    auto_insert_metric_name: false
+    save_weights_only: false
+    every_n_train_steps: 1000
+    train_time_interval: null
+    every_n_epochs: null
+    save_on_train_epoch_end: null
+  early_stopping:
+    _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: val/acc
+    min_delta: 0.0
+    patience: 100
+    verbose: false
+    mode: max
+    strict: false
+    check_finite: true
+    stopping_threshold: null
+    divergence_threshold: null
+    check_on_train_epoch_end: null
+  model_summary: null
+  rich_progress_bar: null
+  module_step_time_profiler: null
+  deepspeed_flops_estimator:
+    _target_: src.utils.callbacks.deepspeed_flops_estimator.DeepSpeedFlopsEstimator
+    enabled: false
+    start_step: 10
+    every_n_steps: 0
+    max_profiled_steps: 1
+    log_to_progress_bar: true
+    sync_dist: true
+  rank_info:
+    _target_: src.utils.callbacks.rank_info.RankInfo
+  peak_gpu_memory: null
+  sync_validation_runner:
+    _target_: src.utils.callbacks.sync_validation_runner.SyncValidationRunner
+    enabled: true
+    eval_config_name: eval
+    eval_overrides: []
+    every_n_train_steps: 5000
+    direct_scalar_logging: true
+    log_media: true
+    fail_on_error: true
+    start_index: 1
+    stop_index: 48
+    max_samples: null
+  async_validation_submitter:
+    _target_: src.utils.callbacks.async_validation_submitter.AsyncValidationSubmitter
+    enabled: false
+    sbatch_script: null
+    extra_args: []
+    submit_host: null
+  ema: null
+logger:
+  wandb:
+    _target_: src.utils.wandb_logger.CustomWandbLogger
+    name: ${task_name}
+    save_dir: ${paths.output_dir}
+    offline: false
+    id: 17vr446q
+    anonymous: null
+    project: plaicraft_group_space
+    log_model: true
+    prefix: ''
+    entity: ${oc.env:WANDB_ENTITY,plaicraft-academic}
+    group: null
+    tags: ${tags}
+    resume: allow
+    notes: 32 H100, training on 1.5k hours of high quality data, using rope for positional
+      embedings, dataframe_level_casual_mask, normal_layout_video_coord
+trainer:
+  _target_: lightning.Trainer
+  default_root_dir: ${paths.output_dir}
+  min_epochs: 100000000
+  max_epochs: -1
+  max_steps: -1
+  accelerator: gpu
+  devices: 4
+  num_nodes: 8
+  strategy:
+    _target_: lightning.pytorch.strategies.DeepSpeedStrategy
+    _convert_: all
+    config:
+      checkpoint:
+        load_universal: ${ds_universal}
+      bf16:
+        enabled: true
+      communication_data_type: fp32
+      zero_optimization:
+        stage: 2
+        allgather_partitions: true
+        allgather_bucket_size: 500000000.0
+        reduce_bucket_size: 500000000.0
+      wall_clock_breakdown: false
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  accumulate_grad_batches: 1
+  log_every_n_steps: 10
+  val_check_interval: 10000
+  check_val_every_n_epoch: null
+  limit_val_batches: 1.0
+  limit_train_batches: 1.0
+  limit_test_batches: 1.0
+  num_sanity_val_steps: 0
+  overfit_batches: 0.0
+  fast_dev_run: false
+  enable_model_summary: true
+  use_distributed_sampler: true
+  enable_progress_bar: true
+  deterministic: false
+paths:
+  root_dir: ${oc.env:PROJECT_ROOT}
+  data_dir: ${oc.env:DATASET_PATH}
+  log_dir: ${paths.root_dir}/logs/
+  output_dir: ${hydra:runtime.output_dir}
+  work_dir: ${hydra:runtime.cwd}
+extras:
+  ignore_warnings: true
+  enforce_tags: true
+  print_config: true

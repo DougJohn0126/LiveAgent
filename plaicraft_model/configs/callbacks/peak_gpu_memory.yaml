@@ -1,0 +1,2 @@
+peak_gpu_memory:
+  _target_: src.utils.callbacks.peak_gpu_memory.PeakGpuMemory

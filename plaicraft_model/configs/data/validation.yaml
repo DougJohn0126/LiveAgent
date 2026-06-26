@@ -1,0 +1,28 @@
+_target_: src.data.datamodule.DataModule # DataModule class
+
+# Dataset parameters
+dataset_path: ${paths.data_dir} # Dataset root path
+validation_metadata_db_path: ${paths.validation_metadata_db_path} # Validation metadata database
+
+# Modalities to use
+modalities: # Modalities to load and return from the datamodule
+  - video
+  - audio_hear
+  - audio_speak
+  - key_press
+  - mouse_movement
+
+# Window parameters (in units, where 1 = 200ms = 2 video frames)
+# All length belows refers to number of dataframes
+window_length_frames: 100 # Number of dataframes in each window
+hop_length_frames: ${window_length_frames} # Fixed hop: non-overlapping validation windows
+
+# Player filtering
+player_names: null
+
+# Data loading
+batch_size: 1 # Number of windows in one Mega-Read batch
+num_workers: 8 # DataLoader worker count
+shuffle: true # Shuffle validation windows
+target_length: 2 # Target sequence length in dataframes
+stm_context_length: ${model.stm_context_length} # Minimum valid context length (must match model STM length)

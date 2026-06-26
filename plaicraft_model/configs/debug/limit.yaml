@@ -1,0 +1,12 @@
+# @package _global_
+
+# uses only 1% of the training data and 5% of validation/test data
+
+defaults: # Inherit base debug config
+  - default # Base debug settings
+
+trainer: # Trainer overrides for limited data
+  max_epochs: 3 # Short run length
+  limit_train_batches: 0.01 # Use 1% of training data
+  limit_val_batches: 0.05 # Use 5% of validation data
+  limit_test_batches: 0.05 # Use 5% of test data

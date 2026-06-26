@@ -1,0 +1,9 @@
+# EDM (Elucidating the Design Space) Scheduler
+# Power-law noise schedule with sigma scaling, NOT COMPLETED YET.
+
+_target_: src.training.noise_schedulers.EDMScheduler # Scheduler class
+target_modalities: ${model.target_modalities}
+
+p: -1.2 # Power-law exponent
+sigma_min: 0.002 # Minimum sigma value
+sigma_max: 80.0 # Maximum sigma value

@@ -1,0 +1,9 @@
+# train with many loggers at once
+
+defaults: # Logger composition order
+  # - comet # Optional Comet logger
+  - csv # CSV logger
+  # - mlflow # Optional MLflow logger
+  # - neptune # Optional Neptune logger
+  - tensorboard # TensorBoard logger
+  - wandb # W&B logger

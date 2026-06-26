@@ -1,0 +1,48 @@
+# Core ML/DL packages
+lightning==2.5.0
+hydra-core==1.3.2
+omegaconf==2.3.0
+deepspeed==0.16.7
+torchmetrics==1.6.1
+tensordict==0.6.2
+wandb==0.26.0
+transformers==4.49.0
+diffusers[torch]==0.32.2
+opencv-python-headless==4.11.0.86
+ffmpeg-python==0.2.0
+
+# Vision/Audio and metrics
+pytorch-fid==0.3.0
+soundfile==0.12.1
+librosa==0.10.2.post1
+scipy==1.11.4
+matplotlib==3.9.2
+whisperx
+sentence-transformers
+
+# Testing
+pytest==8.3.4
+
+# Utility packages
+h5py==3.12.1
+tqdm==4.67.1
+packaging==24.2
+PyYAML==6.0.2
+requests==2.32.3
+python-dateutil==2.9.0.post0
+typing_extensions==4.12.2
+networkx==3.4.2
+rich==13.7.1
+einops==0.7.0
+rootutils==1.0.7
+python-dotenv==1.0.1
+safetensors==0.4.5
+huggingface_hub==0.26.2
+pillow==10.4.0
+av==12.3.0
+
+# Numpy pinned for SciPy compatibility
+numpy==1.26.4
+boto3==1.42.45
+mlstm_kernels==2.0.2
+xlstm==2.0.5

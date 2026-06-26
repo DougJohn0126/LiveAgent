@@ -1,0 +1,6 @@
+defaults: # Inherit base trainer config
+  - default # Base trainer settings
+
+accelerator: cpu # CPU accelerator
+devices: 1 # CPU device count
+precision: 32  # CPU doesn't support mixed precision well

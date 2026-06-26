@@ -1,0 +1,15 @@
+model_checkpoint: # Custom checkpoint callback config
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint # Callback class
+  dirpath: ${paths.output_dir}/checkpoints # Checkpoint directory
+  filename: "epoch_{epoch:03d}_step_{step:07d}" # Checkpoint filename pattern
+  monitor: "train/total_loss"  # Metric to monitor
+  verbose: false # Verbosity mode
+  save_last: true # Always save last checkpoint
+  save_top_k: 1  # Save best K checkpoints
+  mode: "min" # Optimization direction
+  auto_insert_metric_name: false # Keep filename pattern unchanged
+  save_weights_only: false # Save full trainer state
+  every_n_train_steps: 10000  # Save every N steps
+  train_time_interval: null # Save by wall-clock interval
+  every_n_epochs: null # Save every N epochs
+  save_on_train_epoch_end: null # Save at train epoch end

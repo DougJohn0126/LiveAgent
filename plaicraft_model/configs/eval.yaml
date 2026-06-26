@@ -1,0 +1,38 @@
+# @package _global_
+
+# Unified evaluation config:
+# - eval.mode=offline_sample: sampling only
+# - eval.mode=semantic_evaluation: sampling + metrics
+
+defaults:
+  - _self_
+  - inference: offline_sampler
+  - data: sample
+  - model: plai_v1
+  - noise_scheduler: flow_matching
+  - module: plai_v1
+  - extras: default
+  - paths: default
+  - hydra: default
+  - optional local: default
+  - experiment: null
+
+task_name: "eval"
+
+eval:
+  mode: offline_sample
+  # Compute full modality metrics (default: false)
+  compute_full_metrics: false
+
+seed: 42
+device: "cuda"
+model_precision: fp32
+
+# Checkpoint sources (exactly one should be set)
+ckpt_path: null
+wandb_artifact_path: null
+redownload_checkpoints: false
+is_deepspeed_zero_checkpoint: false
+
+# Sampling checkpoint selection
+use_ema_weights: false

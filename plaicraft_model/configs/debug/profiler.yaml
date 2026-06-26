@@ -1,0 +1,12 @@
+# @package _global_
+
+# runs with execution time profiling
+
+defaults: # Inherit base debug config
+  - default # Base debug settings
+
+trainer: # Trainer overrides for profiling
+  max_epochs: 1 # Short run for profile capture
+  profiler: "simple" # Profiler mode
+  # profiler: "advanced"
+  # profiler: "pytorch"

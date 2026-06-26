@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plaicraft"
+version = "0.1.0"
+description = "Plaicraft diffusion model with dataloaders for Minecraft agent training"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "PLAI Group", email = "fwood@cs.ubc.ca"}
+]
+keywords = ["minecraft", "diffusion", "deep-learning", "reinforcement-learning"]
+
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "lightning",
+    "hydra-core",
+    "omegaconf",
+    "deepspeed",
+    "torchmetrics",
+    "tensorboard",
+    "tensordict",
+    "wandb",
+    "transformers",
+    "diffusers[torch]",
+    "whisperx",
+    "fastapi",
+    "uvicorn",
+    "aiohttp",
+    "starlette",
+    "boto3",
+    "lightning-cloud",
+    "lightning-utilities",
+    "numpy>=1.26.4,<3.0",
+    "networkx",
+    "PyYAML",
+    "tqdm",
+    "requests",
+    "packaging",
+    "python-dateutil",
+    "typing_extensions",
+    "pydantic",
+    "h5py",
+    "pillow",
+    "av",
+    "pytorch-fid",
+    "frechet-audio-distance",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/plai-group/plaicraft-model-pi0"
+Repository = "https://github.com/plai-group/plaicraft-model-pi0"
+
+# ---- setuptools src layout ----
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+# ---- setuptools package discovery (modern find_packages()) ----
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["plaicraft*"]
+exclude = [
+    "*.tests*",
+    "tests*",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py38']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = "-v --tb=short"
+timeout = 300
+markers = [
+    "hydra: tests that use Hydra fixtures (may hang, run separately)",
+]

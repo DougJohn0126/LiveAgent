@@ -1,0 +1,31 @@
+defaults: # Callback composition order
+  - model_checkpoint # Checkpoint callback preset
+  - early_stopping # Early stopping preset
+  - model_summary # Model summary preset
+  - rich_progress_bar # Progress bar preset
+  - module_step_time_profiler # Per-component forward/backward timing
+  - deepspeed_flops_estimator # Optional DeepSpeed FLOPs estimate callback
+  - rank_info # Rank information callback
+  - peak_gpu_memory
+  - sync_semantic_evaluation # Blocking in-process semantic evaluation on checkpoint upload
+  - sync_validation # Blocking in-process validation on checkpoint upload
+  - async_semantic_evaluation # Optional async semantic evaluation submission callback
+  # - ema # Exponential Moving Average callback
+  - _self_ # Keep local defaults
+
+model_checkpoint: # Default checkpoint settings
+  dirpath: ${paths.output_dir}/checkpoints # Checkpoint directory
+  filename: "epoch_{epoch:03d}_step_{step:07d}" # Checkpoint filename pattern
+  monitor: "val/acc" # Metric to monitor
+  mode: "max" # Optimization direction
+  save_last: True # Always save last checkpoint
+  auto_insert_metric_name: False # Keep filename pattern unchanged
+
+early_stopping: # Early stopping defaults
+  monitor: "val/acc" # Metric to monitor
+  patience: 100 # Allowed bad epochs
+  mode: "max" # Optimization direction
+  strict: False
+
+model_summary: # Model summary defaults
+  max_depth: -1 # Unlimited depth
