@@ -160,3 +160,4 @@ cython_debug/
 #.idea/
 
 last_fp32/
+last_fp32/pytorch_model.bin
