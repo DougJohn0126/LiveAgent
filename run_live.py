@@ -317,22 +317,38 @@ def main():
     # init() loads model + VAE + Encodec + keypress AE, builds the uinput backend,
     # and starts the sampler thread whose default on_output injects predictions
     # locally. We pass on_output=None so that default local-injection path is used.
-    live_agent.init(make_backend=True)
+    #live_agent.init(make_backend=True)
 
     # Start input capture (continuous). On Wayland ALL of it must come from evdev:
     #   - mouse MOTION  -> rec._linux_raw_input_thread (REL_X/REL_Y)
     #   - keys + clicks -> evdev_keys (EV_KEY) — pynput is X11-only and goes silent
     #     on Wayland, which would feed the model zero key context (degenerate).
     rec._recording.set()
+
     if getattr(rec, "IS_LINUX", True):
-        threading.Thread(target=rec._linux_raw_input_thread, daemon=True).start()
+        threading.Thread(target=rec._linux_raw_mouse_input_thread, daemon=True).start()
+
+def start():
+    """
+    Start the evdev key/click reader in a daemon thread. Returns True if it
+    will actually capture (evdev present), False otherwise.
+    """
+    if evdev is None:
+        print("[evdev_keys] python-evdev not installed — keys/clicks NOT captured "
+              "on Wayland. Install:  pip install evdev")
+        return False
+    threading.Thread(target=_loop, daemon=True).start()
+    return True
+    
     import evdev_keys
     if not evdev_keys.start():
         print("[capture] WARNING: key/click capture is OFF — the model will get no "
               "key_press context and predictions will likely collapse. Fix evdev "
               "access before trusting behavior.")
+    
 
     # Capture threads.
+    """
     region = _resolve_region()
     threading.Thread(target=_video_grab_loop, args=(region,), daemon=True).start()
     if HEAR_DEVICE:
@@ -362,6 +378,10 @@ def main():
         except Exception:
             pass
         print("\n[run_live] stopped.")
+    """
+    while True:
+        pass
+    
 
 
 if __name__ == "__main__":

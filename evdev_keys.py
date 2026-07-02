@@ -71,66 +71,8 @@ def _glfw_code(keycode):
     return -1   # unmapped; matches _key_code's fallback
 
 
-def _find_key_devices():
-    """Devices that emit EV_KEY (keyboards + mice with buttons)."""
-    devs = []
-    for path in evdev.list_devices():
-        try:
-            dev = evdev.InputDevice(path)
-        except (PermissionError, OSError):
-            continue
-        if ecodes.EV_KEY in dev.capabilities():
-            devs.append(dev)
-    return devs
 
 
-def _loop():
-    devs = _find_key_devices()
-    if not devs:
-        print("[evdev_keys] No readable EV_KEY devices in /dev/input — keys/clicks "
-              "will be EMPTY (model gets no key context). Add yourself to 'input':\n"
-              "    sudo usermod -aG input $USER   # then re-login")
-        return
-    print(f"[evdev_keys] capturing keys/clicks from: {', '.join(d.name for d in devs)}")
-
-    sel = selectors.DefaultSelector()
-    for dev in devs:
-        try:
-            sel.register(dev, selectors.EVENT_READ)
-        except Exception:
-            pass
-
-    while True:
-        for key, _mask in sel.select():
-            dev = key.fileobj
-            try:
-                for ev in dev.read():
-                    if ev.type != ecodes.EV_KEY:
-                        continue
-                    if not rec._recording.is_set():
-                        continue
-                    # value: 1=down, 0=up, 2=autorepeat (ignore repeats)
-                    if ev.value == 2:
-                        continue
-                    ts = rec._now_ms()
-                    if ev.code in _BTN:                      # mouse button -> click_buf
-                        lbl = _BTN[ev.code]
-                        act = f"{lbl}_PRESS" if ev.value == 1 else f"{lbl}_RELEASE"
-                        with rec._lock:
-                            rec._click_buf.append({"timestamp": ts, "action": act})
-                    else:                                    # keyboard -> keyboard_buf
-                        act = "PRESS" if ev.value == 1 else "RELEASE"
-                        with rec._lock:
-                            rec._keyboard_buf.append({"timestamp": ts,
-                                                      "key": _glfw_code(ev.code),
-                                                      "action": act})
-            except BlockingIOError:
-                pass
-            except OSError:
-                try:
-                    sel.unregister(dev)
-                except Exception:
-                    pass
 
 
 def start():

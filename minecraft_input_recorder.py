@@ -226,7 +226,7 @@ if IS_WINDOWS:
     kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
  
  
-def _record_move(dx: int, dy: int):
+def _record_move(dx: int, dy: int, timestamp_ms: int | None = None):
     if not _recording.is_set():
         return
     global _vx, _vy
@@ -234,12 +234,13 @@ def _record_move(dx: int, dy: int):
         _vx += dx
         _vy += dy
         _movement_buf.append({
-            "timestamp": _now_ms(),
+            "timestamp": timestamp_ms if timestamp_ms is not None else _now_ms(),
             "mouseX": float(_vx),
             "mouseY": float(_vy),
             "mouseDX": float(dx),
             "mouseDY": float(dy),
         })
+        print(f"time {timestamp_ms} dx={dx} dy={dy}")
  
  
 def _handle_raw_input(hrawinput):
@@ -280,40 +281,11 @@ _CLASS_NAME = "MCRawInputRecorder"
  
 def _raw_input_thread():
     """Create a hidden window, register for raw mouse input, pump messages."""
-    hinst = kernel32.GetModuleHandleW(None)
- 
-    wc = WNDCLASS()
-    wc.lpfnWndProc   = _WNDPROC_PTR
-    wc.hInstance     = hinst
-    wc.lpszClassName = _CLASS_NAME
-    if not user32.RegisterClassW(ctypes.byref(wc)):
-        raise ctypes.WinError(ctypes.get_last_error())
- 
-    hwnd = user32.CreateWindowExW(0, _CLASS_NAME, "rawinput", 0,
-                                  0, 0, 0, 0, None, None, hinst, None)
-    if not hwnd:
-        raise ctypes.WinError(ctypes.get_last_error())
- 
-    rid = RAWINPUTDEVICE()
-    rid.usUsagePage = HID_USAGE_PAGE_GENERIC
-    rid.usUsage     = HID_USAGE_GENERIC_MOUSE
-    rid.dwFlags     = RIDEV_INPUTSINK     # get input while Minecraft is foreground
-    rid.hwndTarget  = hwnd
-    if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1,
-                                          ctypes.sizeof(RAWINPUTDEVICE)):
-        raise ctypes.WinError(ctypes.get_last_error())
- 
-    msg = MSG()
-    while True:
-        r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-        if r == 0 or r == -1:
-            break
-        user32.TranslateMessage(ctypes.byref(msg))
-        user32.DispatchMessageW(ctypes.byref(msg))
+
  
  
 # --------------------------------------------------------------------------- #
-# Linux relative-motion capture (evdev — the analog of Windows Raw Input)
+# Linux relative-motion capture 
 #
 # Reads EV_REL/REL_X/REL_Y straight from the kernel input layer, i.e.
 # device-level relative deltas independent of pointer acceleration or the
@@ -323,20 +295,32 @@ def _raw_input_thread():
 # report == one _record_move() call.
 # --------------------------------------------------------------------------- #
 def _find_relative_mice():
-    """Return evdev devices that emit relative X/Y motion (real mice)."""
+    """Return evdev devices that emit relative X/Y motion and no keyboard events (real mice)."""
     mice = []
+    for path in evdev.list_devices():
+        try:
+            device = evdev.InputDevice(path)
+        except (PermissionError, OSError):
+            continue
+        rel = device.capabilities().get(ecodes.EV_REL, [])
+        if ecodes.REL_X in rel and ecodes.REL_Y in rel and ecodes.KEY_A not in rel:
+            mice.append(device)
+    return mice
+
+def _find_keyclick_devices():
+    """Devices that emit EV_KEY (keyboards + mice with buttons)."""
+    devs = []
     for path in evdev.list_devices():
         try:
             dev = evdev.InputDevice(path)
         except (PermissionError, OSError):
             continue
-        rel = dev.capabilities().get(ecodes.EV_REL, [])
-        if ecodes.REL_X in rel and ecodes.REL_Y in rel:
-            mice.append(dev)
-    return mice
+        if ecodes.EV_KEY in dev.capabilities():
+            devs.append(dev)
+    return devs
  
  
-def _linux_raw_input_thread():
+def _linux_raw_mouse_input_thread():
     """Linux counterpart of _raw_input_thread(): pump evdev relative motion."""
     if evdev is None:
         print("[linux] python-evdev not installed — mouse MOVEMENT will not be "
@@ -358,16 +342,31 @@ def _linux_raw_input_thread():
     print(f"[linux] Capturing raw motion from: "
           f"{', '.join(d.name for d in mice)}")
  
+    #initializes the event monitoring system (selector engine 'epoll')
     sel = selectors.DefaultSelector()
-    for dev in mice:
+    for mouse in mice:
         try:
-            sel.register(dev, selectors.EVENT_READ)
+            #signs up the specific mouse to be watched by the selector.
+            sel.register(mouse, selectors.EVENT_READ)
         except Exception:
             pass
- 
+    
+    REPORT_INTERVAL_MS = 10
+    REPORT_INTERVAL = REPORT_INTERVAL_MS / 1000.0
+
     dx = dy = 0
+    tick = 0  # bin index — bin 0 = t=0, bin 1 = t=10, bin 2 = t=20, ...
+    start_mono = time.monotonic()
+    next_emit_mono = start_mono + REPORT_INTERVAL
+
     while True:
-        for key, _mask in sel.select():
+        timeout = next_emit_mono - time.monotonic()
+        if timeout < 0:
+            timeout = 0
+        # calling from the selector engine allows the process to sleep during moments when it is
+        events_ready = sel.select(timeout=timeout)
+
+        for key, _mask in events_ready:
             dev = key.fileobj
             try:
                 for event in dev.read():
@@ -376,15 +375,112 @@ def _linux_raw_input_thread():
                             dx += event.value
                         elif event.code == ecodes.REL_Y:
                             dy += event.value
-                    elif (event.type == ecodes.EV_SYN
-                          and event.code == ecodes.SYN_REPORT):
-                        if dx or dy:
-                            _record_move(dx, dy)
-                        dx = dy = 0
             except BlockingIOError:
                 pass
             except OSError:
-                # Device unplugged mid-session — drop it and keep going.
+                try:
+                    sel.unregister(dev)
+                except Exception:
+                    pass
+
+        now = time.monotonic()
+        if now >= next_emit_mono:
+            tick += 1
+            _record_move(dx, dy, timestamp_ms=tick * REPORT_INTERVAL_MS)
+            dx = dy = 0
+
+            next_emit_mono += REPORT_INTERVAL
+            if next_emit_mono <= now:
+                # we fell behind — jump tick/next_emit forward together
+                # instead of letting it re-derive from "now" (which drifts)
+                missed = int((now - next_emit_mono) / REPORT_INTERVAL) + 1
+                tick += missed
+                next_emit_mono += missed * REPORT_INTERVAL
+
+_GLFW_SPECIAL = {
+    ecodes.KEY_SPACE: 32, ecodes.KEY_ENTER: 257, ecodes.KEY_TAB: 258,
+    ecodes.KEY_BACKSPACE: 259, ecodes.KEY_INSERT: 260, ecodes.KEY_DELETE: 261,
+    ecodes.KEY_RIGHT: 262, ecodes.KEY_LEFT: 263, ecodes.KEY_DOWN: 264,
+    ecodes.KEY_UP: 265, ecodes.KEY_PAGEUP: 266, ecodes.KEY_PAGEDOWN: 267,
+    ecodes.KEY_HOME: 268, ecodes.KEY_END: 269, ecodes.KEY_CAPSLOCK: 280,
+    ecodes.KEY_SCROLLLOCK: 281, ecodes.KEY_NUMLOCK: 282, ecodes.KEY_SYSRQ: 283,
+    ecodes.KEY_PAUSE: 284, ecodes.KEY_F1: 290, ecodes.KEY_F2: 291,
+    ecodes.KEY_F3: 292, ecodes.KEY_F4: 293, ecodes.KEY_F5: 294, ecodes.KEY_F6: 295,
+    ecodes.KEY_F7: 296, ecodes.KEY_F8: 297, ecodes.KEY_F9: 298, ecodes.KEY_F10: 299,
+    ecodes.KEY_F11: 300, ecodes.KEY_F12: 301, ecodes.KEY_LEFTSHIFT: 340,
+    ecodes.KEY_RIGHTSHIFT: 344, ecodes.KEY_LEFTCTRL: 341, ecodes.KEY_RIGHTCTRL: 345,
+    ecodes.KEY_LEFTALT: 342, ecodes.KEY_RIGHTALT: 346, ecodes.KEY_ESC: 256,
+} if evdev is not None else {}
+
+_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_DIGITS = "0123456789"
+_CHAR = {}
+if evdev is not None:
+    for _c in _LETTERS:
+        _CHAR[getattr(ecodes, f"KEY_{_c}")] = ord(_c)            # rec uses upper()
+    for _d in _DIGITS:
+        _CHAR[getattr(ecodes, f"KEY_{_d}")] = ord(_d)
+
+_BTN = {
+    ecodes.BTN_LEFT:   "LEFT",
+    ecodes.BTN_RIGHT:  "RIGHT",
+    ecodes.BTN_MIDDLE: "MIDDLE",
+} if evdev is not None else {}
+
+
+def _glfw_code(keycode):
+    if keycode in _GLFW_SPECIAL:
+        return _GLFW_SPECIAL[keycode]
+    if keycode in _CHAR:
+        return _CHAR[keycode]
+    return -1   # unmapped; matches _key_code's fallback
+
+
+
+
+def _linux_raw_key_click_input_thread():
+    devices = _find_keyclick_devices()
+    if not devices:
+        print("[evdev_keys] No readable EV_KEY devices in /dev/input — keys/clicks "
+              "will be EMPTY (model gets no key context). Add yourself to 'input':\n"
+              "    sudo usermod -aG input $USER   # then re-login")
+        return
+    print(f"[evdev_keys] capturing keys/clicks from: {', '.join(d.name for d in devs)}")
+
+    sel = selectors.DefaultSelector()
+    for dev in devices:
+        try:
+            sel.register(dev, selectors.EVENT_READ)
+        except Exception:
+            pass
+
+    while True:
+        for key, _mask in sel.select():
+            dev = key.fileobj
+            try:
+                for ev in dev.read():
+                    if ev.type != ecodes.EV_KEY:
+                        continue
+                    if not rec._recording.is_set():
+                        continue
+                    # value: 1=down, 0=up, 2=autorepeat (ignore repeats)
+                    if ev.value == 2:
+                        continue
+                    ts = rec._now_ms()
+                    if ev.code in _BTN:                      # mouse button -> click_buf
+                        lbl = _BTN[ev.code]
+                        act = f"{lbl}_PRESS" if ev.value == 1 else f"{lbl}_RELEASE"
+                        with rec._lock:
+                            _click_buf.append({"timestamp": ts, "action": act})
+                    else:                                    # keyboard -> keyboard_buf
+                        act = "PRESS" if ev.value == 1 else "RELEASE"
+                        with rec._lock:
+                            rec._keyboard_buf.append({"timestamp": ts,
+                                                      "key": _glfw_code(ev.code),
+                                                      "action": act})
+            except BlockingIOError:
+                pass
+            except OSError:
                 try:
                     sel.unregister(dev)
                 except Exception:
@@ -803,7 +899,7 @@ def main():
     # Mouse-movement capture thread (device-level relative deltas).
     if IS_WINDOWS:
         # Raw Input: creates its own hidden window + message loop.
-        threading.Thread(target=_raw_input_thread, daemon=True).start()
+        print ("windows not supported anymore")
     elif IS_LINUX:
         # evdev: reads relative motion straight from /dev/input.
         threading.Thread(target=_linux_raw_input_thread, daemon=True).start()
