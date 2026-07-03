@@ -72,6 +72,7 @@ import minecraft_input_recorder as rec
 LATENT_FPS       = int(os.environ.get("PLAICRAFT_FPS", "10"))
 FRAMES_PER_UNIT  = int(getattr(live_agent, "VIDEO_FRAMES_PER_UNIT", 2))   # 2
 GRAB_WH          = (1280, 720)
+# 
 FRAME_BYTES      = GRAB_WH[0] * GRAB_WH[1] * 3
 QUEUE_MAX        = 50
 UNIT_MS          = FRAMES_PER_UNIT * (1000 // LATENT_FPS)                 # 200
@@ -327,30 +328,16 @@ def main():
 
     if getattr(rec, "IS_LINUX", True):
         threading.Thread(target=rec._linux_raw_mouse_input_thread, daemon=True).start()
+        threading.Thread(target=rec._linux_raw_key_click_input_thread, daemon=True).start()
 
-def start():
-    """
-    Start the evdev key/click reader in a daemon thread. Returns True if it
-    will actually capture (evdev present), False otherwise.
-    """
-    if evdev is None:
-        print("[evdev_keys] python-evdev not installed — keys/clicks NOT captured "
-              "on Wayland. Install:  pip install evdev")
-        return False
-    threading.Thread(target=_loop, daemon=True).start()
-    return True
-    
-    import evdev_keys
-    if not evdev_keys.start():
-        print("[capture] WARNING: key/click capture is OFF — the model will get no "
-              "key_press context and predictions will likely collapse. Fix evdev "
-              "access before trusting behavior.")
+
     
 
     # Capture threads.
-    """
+
     region = _resolve_region()
     threading.Thread(target=_video_grab_loop, args=(region,), daemon=True).start()
+    """
     if HEAR_DEVICE:
         threading.Thread(target=_audio_grab_loop,
                          args=(HEAR_DEVICE, _hear_buf, _hear_lock, "hear"),

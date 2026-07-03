@@ -49,6 +49,7 @@ import pickle
 import threading
 import traceback
 import os
+import torch
 from pathlib import Path
 from dotenv import load_dotenv
 import scripts_replay.inputInjector
@@ -346,7 +347,6 @@ def _load_model(ckpt_path, device):
     # read the checkpoint — otherwise model (CPU) + checkpoint (CPU) = 2x ~7 GB.
     model = hydra.utils.instantiate(cfg.model).to(device).eval()
     gc.collect()
-    print ("still okay")
     sd = _torch_load_low_mem(ckpt_path)
     sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
     clean = {}
@@ -370,7 +370,7 @@ def ingest_window(mouse_events, click_events, key_events, clip_path):
     """Push one captured window to the model's ring buffer.
  
     mouse_events / click_events / key_events are the RAW lists of dicts the
-    recorder already holds — no JSON, no SQLite. (JSON strings are still
+    recorder already holds (JSON strings are still
     accepted for backward compatibility.)
     """
     def _as_list(x):
@@ -603,7 +603,7 @@ def _keys_to_multihot(key_events, click_events, t0, n_frames):
 def _encode_keys_inmemory(key_events, click_events, t0, n_frames):
     """Raw key/click events -> {frame_idx: (16,5)} via the preloaded AE
     (no JSON, no SQLite, no per-call AE reload)."""
-    import torch
+  
     frames = _keys_to_multihot(key_events, click_events, t0, n_frames)
     with torch.no_grad():
         z = _S["ae"].encoder(torch.from_numpy(frames)).cpu().numpy()   # (n_frames,16,5)

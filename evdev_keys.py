@@ -21,7 +21,7 @@ Needs read access to /dev/input/event*  (be in the 'input' group, or run as root
 import threading
 import selectors
 
-import minecraft_input_recorder as rec
+import minecraft_input_recorder as recorder
 
 try:
     import evdev
@@ -88,12 +88,12 @@ def start():
 
 if __name__ == "__main__":
     # Quick standalone check: prints captured key/click events for a few seconds.
-    rec._recording.set()
+    recorder._recording.set()
     start()
     import time
     print("Press keys / click for 8s…")
     t0 = time.time()
     while time.time() - t0 < 8:
         time.sleep(1)
-        with rec._lock:
-            print(f"  keys={len(rec._keyboard_buf)}  clicks={len(rec._click_buf)}")
+        with recorder._lock:
+            print(f"  keys={len(recorder._keyboard_buf)}  clicks={len(recorder._click_buf)}")

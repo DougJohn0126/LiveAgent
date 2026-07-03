@@ -41,8 +41,10 @@ import traceback
 import subprocess
 import signal
 import imageio_ffmpeg
+import queue
 from pathlib import Path
 from pynput import mouse, keyboard
+import numpy as np
  
 # --------------------------------------------------------------------------- #
 # Platform detection — this recorder now runs on Windows AND Linux (X11).
@@ -63,17 +65,18 @@ elif IS_LINUX:
 # The replay/injection side (inputInjector) is a separate, currently
 # Windows-oriented module. Import it lazily so the recorder still runs on
 # Linux even when the injector can't be imported — replay is just skipped.
+"""
 try:
-    import scripts_replay.inputInjector as inputInjector
+    #import scripts_replay.inputInjector as inputInjector
 except Exception as _inj_err:
     inputInjector = None
     print(f"[warn] inputInjector unavailable ({_inj_err!r}); replay disabled.")
- 
+ """
  
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-WINDOW_TITLE    = os.environ.get("PLAICRAFT_WINDOW_TITLE", "x11grab").lower()
+WINDOW_TITLE    = os.environ.get("PLAICRAFT_WINDOW_TITLE", "Minecraft 1.21.4").lower()
 OUTPUT_DIR      = Path("recordings")
 FLUSH_INTERVAL  = 5      # seconds
 REPLAY_ON_FLUSH = True   # set False to record only (no immediate replay loop)
@@ -107,12 +110,7 @@ def _now_ms() -> int:
     """Current time in milliseconds (matches the sample data format)."""
     return int(time.time() * 1000)
  
-# --------------------------------------------------------------------------- #
-# Raw Input (WM_INPUT) mouse-movement capture
-# --------------------------------------------------------------------------- #
-if IS_WINDOWS:
-    user32   = ctypes.WinDLL("user32",   use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
  
 LRESULT = wt.LPARAM  # pointer-sized signed
  
@@ -164,67 +162,9 @@ class RAWINPUT(ctypes.Structure):
                 ("mouse",  RAWMOUSE)]
  
  
-# WINFUNCTYPE only exists on Windows; CFUNCTYPE is an import-safe stand-in on
-# Linux (this callback type is only ever actually used on Windows).
-_FUNCTYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
-WNDPROC = _FUNCTYPE(LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
  
- 
-class WNDCLASS(ctypes.Structure):
-    _fields_ = [("style",        wt.UINT),
-                ("lpfnWndProc",   WNDPROC),
-                ("cbClsExtra",    ctypes.c_int),
-                ("cbWndExtra",    ctypes.c_int),
-                ("hInstance",     wt.HINSTANCE),
-                ("hIcon",         wt.HANDLE),
-                ("hCursor",       wt.HANDLE),
-                ("hbrBackground", wt.HANDLE),
-                ("lpszMenuName",  wt.LPCWSTR),
-                ("lpszClassName", wt.LPCWSTR)]
- 
- 
-class MSG(ctypes.Structure):
-    _fields_ = [("hwnd",    wt.HWND),
-                ("message", wt.UINT),
-                ("wParam",  wt.WPARAM),
-                ("lParam",  wt.LPARAM),
-                ("time",    wt.DWORD),
-                ("pt_x",    wt.LONG),
-                ("pt_y",    wt.LONG)]
- 
- 
-# --- prototypes (REQUIRED on 64-bit so handles/pointers aren't truncated) --- #
-if IS_WINDOWS:
-    user32.DefWindowProcW.restype  = LRESULT
-    user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
- 
-    user32.GetRawInputData.restype  = wt.UINT
-    user32.GetRawInputData.argtypes = [wt.HANDLE, wt.UINT, wt.LPVOID,
-                                       ctypes.POINTER(wt.UINT), wt.UINT]
- 
-    user32.RegisterRawInputDevices.restype  = wt.BOOL
-    user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE),
-                                               wt.UINT, wt.UINT]
- 
-    user32.RegisterClassW.restype  = wt.ATOM
-    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASS)]
- 
-    user32.CreateWindowExW.restype  = wt.HWND
-    user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
-                                       ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                       ctypes.c_int, wt.HWND, wt.HMENU,
-                                       wt.HINSTANCE, wt.LPVOID]
- 
-    user32.GetMessageW.restype  = ctypes.c_int
-    user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), wt.HWND, wt.UINT, wt.UINT]
- 
-    user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
-    user32.DispatchMessageW.restype  = LRESULT
-    user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
- 
-    kernel32.GetModuleHandleW.restype  = wt.HMODULE
-    kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
- 
+
  
 def _record_move(dx: int, dy: int, timestamp_ms: int | None = None):
     if not _recording.is_set():
@@ -234,14 +174,14 @@ def _record_move(dx: int, dy: int, timestamp_ms: int | None = None):
         _vx += dx
         _vy += dy
         _movement_buf.append({
-            "timestamp": timestamp_ms if timestamp_ms is not None else _now_ms(),
+            "timestamp": timestamp_ms,
             "mouseX": float(_vx),
             "mouseY": float(_vy),
             "mouseDX": float(dx),
             "mouseDY": float(dy),
         })
-        print(f"time {timestamp_ms} dx={dx} dy={dy}")
- 
+    print (f"timestamp : { timestamp_ms}")
+
  
 def _handle_raw_input(hrawinput):
     size = wt.UINT(0)
@@ -274,15 +214,10 @@ def _wndproc(hwnd, msg, wparam, lparam):
     return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
  
  
-# Keep a module-level reference so the callback isn't garbage-collected.
-_WNDPROC_PTR = WNDPROC(_wndproc)
-_CLASS_NAME = "MCRawInputRecorder"
- 
  
 def _raw_input_thread():
     """Create a hidden window, register for raw mouse input, pump messages."""
 
- 
  
 # --------------------------------------------------------------------------- #
 # Linux relative-motion capture 
@@ -306,18 +241,6 @@ def _find_relative_mice():
         if ecodes.REL_X in rel and ecodes.REL_Y in rel and ecodes.KEY_A not in rel:
             mice.append(device)
     return mice
-
-def _find_keyclick_devices():
-    """Devices that emit EV_KEY (keyboards + mice with buttons)."""
-    devs = []
-    for path in evdev.list_devices():
-        try:
-            dev = evdev.InputDevice(path)
-        except (PermissionError, OSError):
-            continue
-        if ecodes.EV_KEY in dev.capabilities():
-            devs.append(dev)
-    return devs
  
  
 def _linux_raw_mouse_input_thread():
@@ -342,11 +265,11 @@ def _linux_raw_mouse_input_thread():
     print(f"[linux] Capturing raw motion from: "
           f"{', '.join(d.name for d in mice)}")
  
-    #initializes the event monitoring system (selector engine 'epoll')
+    # initializes the event monitoring system (selector engine 'epoll')
     sel = selectors.DefaultSelector()
     for mouse in mice:
         try:
-            #signs up the specific mouse to be watched by the selector.
+            # signs up the specific mouse to be watched by the selector.
             sel.register(mouse, selectors.EVENT_READ)
         except Exception:
             pass
@@ -397,6 +320,27 @@ def _linux_raw_mouse_input_thread():
                 tick += missed
                 next_emit_mono += missed * REPORT_INTERVAL
 
+def _find_keyclick_devices():
+    """Devices that emit EV_KEY (keyboards + mice with buttons)."""
+    devs = []
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except (PermissionError, OSError):
+            continue
+        if ecodes.EV_KEY in dev.capabilities():
+            devs.append(dev)
+    return devs
+
+_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_DIGITS = "0123456789"
+# A dictionary of key to unicode mappings
+_CHAR = {}
+if evdev is not None:
+    for _c in _LETTERS:
+        _CHAR[getattr(ecodes, f"KEY_{_c}")] = ord(_c)
+    for _d in _DIGITS:
+        _CHAR[getattr(ecodes, f"KEY_{_d}")] = ord(_d)
 _GLFW_SPECIAL = {
     ecodes.KEY_SPACE: 32, ecodes.KEY_ENTER: 257, ecodes.KEY_TAB: 258,
     ecodes.KEY_BACKSPACE: 259, ecodes.KEY_INSERT: 260, ecodes.KEY_DELETE: 261,
@@ -412,16 +356,7 @@ _GLFW_SPECIAL = {
     ecodes.KEY_LEFTALT: 342, ecodes.KEY_RIGHTALT: 346, ecodes.KEY_ESC: 256,
 } if evdev is not None else {}
 
-_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-_DIGITS = "0123456789"
-_CHAR = {}
-if evdev is not None:
-    for _c in _LETTERS:
-        _CHAR[getattr(ecodes, f"KEY_{_c}")] = ord(_c)            # rec uses upper()
-    for _d in _DIGITS:
-        _CHAR[getattr(ecodes, f"KEY_{_d}")] = ord(_d)
-
-_BTN = {
+_CLICK_BTN = {
     ecodes.BTN_LEFT:   "LEFT",
     ecodes.BTN_RIGHT:  "RIGHT",
     ecodes.BTN_MIDDLE: "MIDDLE",
@@ -439,13 +374,24 @@ def _glfw_code(keycode):
 
 
 def _linux_raw_key_click_input_thread():
-    devices = _find_keyclick_devices()
+    
+    if evdev is None:
+        print("[linux] python-evdev not installed — mouse MOVEMENT will not be "
+              "captured. Install it with:  pip install evdev")
+        return
+    
+    try:
+        devices = _find_keyclick_devices()
+    except PermissionError:
+        devices = []
+
     if not devices:
         print("[evdev_keys] No readable EV_KEY devices in /dev/input — keys/clicks "
               "will be EMPTY (model gets no key context). Add yourself to 'input':\n"
               "    sudo usermod -aG input $USER   # then re-login")
         return
-    print(f"[evdev_keys] capturing keys/clicks from: {', '.join(d.name for d in devs)}")
+
+    print(f"[evdev_keys] capturing keys/clicks from: {', '.join(d.name for d in devices)}")
 
     sel = selectors.DefaultSelector()
     for dev in devices:
@@ -455,29 +401,31 @@ def _linux_raw_key_click_input_thread():
             pass
 
     while True:
+        # calling from the selector engine allows the process to sleep during moments when it is
         for key, _mask in sel.select():
             dev = key.fileobj
             try:
                 for ev in dev.read():
                     if ev.type != ecodes.EV_KEY:
                         continue
-                    if not rec._recording.is_set():
-                        continue
                     # value: 1=down, 0=up, 2=autorepeat (ignore repeats)
                     if ev.value == 2:
                         continue
-                    ts = rec._now_ms()
-                    if ev.code in _BTN:                      # mouse button -> click_buf
-                        lbl = _BTN[ev.code]
+                    ts = _now_ms()
+                    if ev.code in _CLICK_BTN:                      # mouse button -> click_buf
+                        lbl = _CLICK_BTN[ev.code]
                         act = f"{lbl}_PRESS" if ev.value == 1 else f"{lbl}_RELEASE"
-                        with rec._lock:
+                        with _lock:
                             _click_buf.append({"timestamp": ts, "action": act})
+
+                            print (f"timestamp {ts} : action {act}")
                     else:                                    # keyboard -> keyboard_buf
                         act = "PRESS" if ev.value == 1 else "RELEASE"
-                        with rec._lock:
-                            rec._keyboard_buf.append({"timestamp": ts,
+                        with _lock:
+                            _keyboard_buf.append({"timestamp": ts,
                                                       "key": _glfw_code(ev.code),
                                                       "action": act})
+                            print (f"timestamp {ts} : key: {_glfw_code(ev.code)} : action {act}")
             except BlockingIOError:
                 pass
             except OSError:
@@ -486,7 +434,212 @@ def _linux_raw_key_click_input_thread():
                 except Exception:
                     pass
  
- 
+ # ----------------------------------------------------------------------------- #
+# Config (capture-side only; model/sampler config comes from live_agent's env)
+# ----------------------------------------------------------------------------- #
+LATENT_FPS       = int(os.environ.get("PLAICRAFT_FPS", "10"))
+FRAMES_PER_UNIT  = 2
+GRAB_WH          = (1280, 720)
+# every frame is rescaled to 720p, BGR, 3 bytes/pixel
+FRAME_BYTES      = GRAB_WH[0] * GRAB_WH[1] * 3
+QUEUE_MAX        = 100
+UNIT_MS          = FRAMES_PER_UNIT * (1000 // LATENT_FPS)                 # 200
+
+
+# Video and audio come off separate ffmpeg pipes with different buffering lag, so
+# they need *independent* time-offset corrections (the old single FRAME_LATENCY_MS
+# was wrong for audio). Tune each by watching an obvious action vs its frame/sound.
+FRAME_LATENCY_MS = int(os.environ.get("PLAICRAFT_FRAME_LATENCY_MS", "100"))
+AUDIO_LATENCY_MS = int(os.environ.get("PLAICRAFT_AUDIO_LATENCY_MS", "100"))
+
+VIDEO_BACKEND = os.environ.get("PLAICRAFT_VIDEO_BACKEND", "x11grab").lower()
+HEAR_DEVICE   = os.environ.get("PLAICRAFT_AUDIO_HEAR_DEVICE", "")   # sink .monitor
+SPEAK_DEVICE  = os.environ.get("PLAICRAFT_AUDIO_SPEAK_DEVICE", "")  # mic source
+
+_stop = threading.Event()
+_frame_q = queue.Queue(maxsize=QUEUE_MAX)
+
+
+
+def _linux_raw_video_input_thread():
+    import subprocess
+    region = _resolve_region();
+    proc = subprocess.Popen(_video_cmd(region), stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, bufsize=FRAME_BYTES)
+    print("[capture] video grabber started (x11grab / XWayland).", flush=True)
+    try:
+        x = 0
+        while not _stop.is_set():
+            raw = _read_exact(proc.stdout, FRAME_BYTES)
+            if raw is None:
+                print("[capture] video pipe ended — wrong DISPLAY/region, or the "
+                      "window is native-Wayland (try PLAICRAFT_VIDEO_BACKEND=portal).",
+                      flush=True)
+                break
+            t = _now_ms()
+            frame = np.frombuffer(raw, np.uint8).reshape(GRAB_WH[1], GRAB_WH[0], 3)
+            try:
+                x += 1
+                _frame_q.put_nowait((t, frame))
+                if (x % 10 == 0):
+                    for item in list(_frame_q.queue):
+                        print(item[0])
+            except queue.Full:                 # stay current: drop oldest
+                try:
+                    _frame_q.get_nowait()
+                    _frame_q.put_nowait((t, frame))
+                except queue.Empty:
+                    pass
+
+    finally:
+        try:
+            print ("asdf")
+            proc.kill()
+        except Exception:
+            pass
+
+def measure(seconds=10):
+    region = _resolve_region()
+    proc = subprocess.Popen(_video_cmd(region), stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, bufsize=FRAME_BYTES * 8)
+    n, t0, last = 0, time.time(), time.time()
+    while time.time() - t0 < seconds:
+        raw = _read_exact(proc.stdout, FRAME_BYTES)
+        if raw is None:
+            break
+        n += 1
+        now = time.time()
+        if now - last >= 1.0:                 # report once per second, not per frame
+            print(f"{n} frames, {n / (now - t0):.1f} fps avg")
+            last = now
+    proc.kill()
+    print(f"final: {n / (time.time() - t0):.1f} fps over {seconds}s")
+
+
+
+
+def _ffmpeg_bin():
+    if os.environ.get("FFMPEG_BINARY"):
+        return os.environ["FFMPEG_BINARY"]
+    import shutil
+    sys_ff = shutil.which("ffmpeg")     # prefer the system build (has pulse + x11grab)
+    if sys_ff:
+        return sys_ff
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
+def _read_exact(stream, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+
+# ----------------------------------------------------------------------------- #
+# Region resolution: env override -> recorder's window finder -> full-ish default
+# ----------------------------------------------------------------------------- #
+def _resolve_region():
+    try:
+        win = find_window(WINDOW_TITLE)
+        print(f"[capture] found window '{win['title']}")
+        if win:
+            
+            try:
+                moved = focus_window(win["hwnd"])
+                if moved:
+                    win['left']=moved[0]
+                    win['top']=moved[1]
+                    win['width']=moved[2]
+                    win['height']=moved[3]
+                
+            except Exception:
+                pass
+            return (win["left"], win["top"], win["width"], win["height"])
+    except Exception as e:
+        print(f"[capture] find_window failed ({e}); falling back to default region")
+    print("[capture] using default region 0,0 1280x720 — set "
+          "PLAICRAFT_CAPTURE_REGION=x,y,w,h to capture the Minecraft window exactly")
+    return (0, 0, 1280, 720)
+
+
+# ----------------------------------------------------------------------------- #
+# Video capture -> raw BGR frames on a queue (no JPEG; in-process feeds the VAE
+# directly). x11grab works under XWayland; portal stub for native Wayland.
+# ----------------------------------------------------------------------------- #
+def _video_cmd(region):
+    left, top, w, h = region
+    w -= w % 2
+    h -= h % 2
+    out = ["-r", str(LATENT_FPS),
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    display = os.environ.get("DISPLAY", ":0")
+    return [_ffmpeg_bin(), "-hide_banner", "-loglevel", "error",
+            "-f", "x11grab", "-framerate", str(LATENT_FPS),
+            "-video_size", f"{w}x{h}", "-i", f"{display}+{left},{top}", *out]
+
+
+
+def _video_cmd_test(region):
+    left, top, w, h = region
+    w -= w % 2
+    h -= h % 2
+    out = ["-r", str(LATENT_FPS),
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", "output.mp4"]
+    display = os.environ.get("DISPLAY", ":0")
+    print (display)
+    return [_ffmpeg_bin(), "-hide_banner", "-loglevel", "error",
+            "-f", "x11grab", "-framerate", str(LATENT_FPS),
+            "-video_size", f"{w}x{h}", "-i", f"{display}+{left},{top}", *out]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # --------------------------------------------------------------------------- #
 # Mouse click listener (pynput — unaffected by cursor grab)
 # --------------------------------------------------------------------------- #
@@ -803,10 +956,12 @@ def _linux_find_window(sub):
         if len(parts) < 4:
             continue
         wid, _desktop, _host, title = parts
+        print (title)
         if sub.lower() in title.lower():
             geo = _xwininfo_geometry(wid)
             if geo is None:
                 continue
+            print (parts)
             return {"hwnd": wid, "title": title, **geo}
     return None
  
@@ -826,7 +981,6 @@ def _linux_focus_window(wid, x=100, y=100, width=1280, height=720):
         "remove,maximized_vert,maximized_horz,fullscreen"
     ], check=False)
     time.sleep(0.1)
-    print ("success?")
     """Resizes and moves a window using xdotool."""
     try:
         # Move the window
