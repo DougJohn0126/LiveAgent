@@ -14,7 +14,7 @@ LATENT_SEQ_LEN = 5               # KeyPressAutoencoder latent_seq_len
 INPUT_DIM = 79                   # channels: 75 keys + 4 mouse actions
 BINS_PER_WINDOW = 10             # original_seq_len: 10 x 10 ms = 100 ms
 KEY_ON_THRESH = 0.5              # activation -> pressed
-CHECKPOINT_DIR = "plaicraft_model/encode_key_press/checkpoints/keyencoder_16_5_best_checkpoint.pt"
+CHECKPOINT_DIR = "../plaimodel/encode_key_press/checkpoints/keyencoder_16_5_best_checkpoint.pt"
  
 # --------------------------------------------------------------------------- #
 #  Channel map — VERBATIM from encode_key_press/scripts/constants.py.
