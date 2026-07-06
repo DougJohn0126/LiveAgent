@@ -38,7 +38,7 @@ TARGET_MODALITIES = os.environ.get("PLAICRAFT_TARGET_MODALITIES")
 VAE_MODE = os.environ.get("PLAICRAFT_VAE", "sdxl").lower()
 PROFILE_VAE = os.environ.get("PLAICRAFT_PROFILE", "0").lower() in ("1", "true", "yes")
 
-VAE_BATCH_SIZE = os.environ.get("PLAICRAFT_VAE_BATCH_SIZE", 2)
+VAE_BATCH_SIZE = int(os.environ.get("PLAICRAFT_VAE_BATCH_SIZE", 2))
  
 for p in (str(AGENT_DIR), str(MODEL_REPO), str(MODEL_REPO / "src")):
     if p and p not in sys.path:
