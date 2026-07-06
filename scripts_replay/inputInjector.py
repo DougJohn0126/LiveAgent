@@ -28,9 +28,6 @@ import time
 import threading
 import argparse
 import sys
-import sqlite3
-import scripts_replay.convert_mouse_movement 
-import scripts_replay.convert_keyboard_movement
 import scripts_replay.data_preprocessor as data_preprocessor
 from pathlib import Path
  
@@ -104,10 +101,6 @@ class WindowsBackend:
         # letters and digits map 1:1 (a→a, w→w, 1→1 etc.)
     }
  
-    def __init__(self):
-        import pydirectinput as pdi
-        pdi.PAUSE = 0  # disable pydirectinput's built-in inter-call delay
-        self._pdi = pdi
  
     def _map(self, key_name):
         return self.KEY_MAP.get(key_name, key_name)
@@ -258,7 +251,7 @@ class LinuxBackend:
             pass
  
  
-def make_backend():
+def init_injector():
     if IS_WINDOWS:
         return WindowsBackend()
     if IS_LINUX:
@@ -355,11 +348,11 @@ def replay(mousedata: str, clickdata: str, keydata: str, videopath: Path):
     cur.execute(""" SELECT timestamp, mouseDX, mouseDY FROM mouse_movement """)
  
     mouse_data = cur.fetchall()
-    encoded_data = encode_key_press_main.main(db, 32, "cpu", False)
-    encoded_video = encode_video_main.main(new_video_path, 32,  False);
+    #encoded_data = encode_key_press_main.main(db, 32, "cpu", False)
+    #encoded_video = encode_video_main.main(new_video_path, 32,  False);
     
  
-    keys_data = decode_keypress_latents.main(encoded_data)
+    #keys_data = decode_keypress_latents.main(encoded_data)
     if (keys_data == ""):
         key_events  = []
     else:
@@ -369,7 +362,7 @@ def replay(mousedata: str, clickdata: str, keydata: str, videopath: Path):
     bin_ms       = 10
  
  
-    backend = make_backend()
+    backend = init_injector()
     _timer_begin()
  
     start_perf = time.perf_counter()
@@ -441,7 +434,7 @@ def main():
  
     # Build the input backend before the countdown so any setup/permission
     # errors surface immediately.
-    backend = make_backend()
+    backend = init_injector()
  
     print(f"Starting in {args.delay:.0f}s — switch to your game now...")
     time.sleep(args.delay)

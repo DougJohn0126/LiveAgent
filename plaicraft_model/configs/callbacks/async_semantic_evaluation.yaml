@@ -1,6 +1,0 @@
-async_semantic_evaluation:
-  _target_: src.utils.callbacks.async_semantic_evaluation.AsyncSemanticEvaluation
-  enabled: false
-  sbatch_script: null
-  extra_args: []
-  submit_host: null

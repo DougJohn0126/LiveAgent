@@ -1,6 +1,0 @@
-# Custom EMA callback backed by src.models.components.ema.LitEma
-
-ema:
-  _target_: src.models.components.ema.EMACallback
-  decay: 0.9999
-  evaluate_ema_weights_instead: true # Automatically swaps to EMA weights during validation/testing

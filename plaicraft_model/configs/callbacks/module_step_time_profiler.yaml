@@ -1,6 +1,0 @@
-module_step_time_profiler:
-  _target_: src.utils.callbacks.module_step_time_profiler.ModuleStepTimeProfiler
-  enabled: true
-  log_to_progress_bar: true
-  synchronize_cuda_timing: true
-  print_summary_every_n_steps: 20

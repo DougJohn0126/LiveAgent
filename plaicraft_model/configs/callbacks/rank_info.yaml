@@ -1,2 +1,0 @@
-rank_info:
-  _target_: src.utils.callbacks.rank_info.RankInfo

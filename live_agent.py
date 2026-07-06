@@ -1,69 +1,44 @@
-"""
- 
-live_agent.py  —  bridge between AgentDeployer (capture + encode + inject) and
-the PLAICraft online sampler (online_sampler.OnlineSampler).
- 
-It turns AgentDeployer's "record 5 s -> replay your own recording" loop into:
- 
-      capture window ──▶ ENCODE to dataframes ──▶ push to sampler ring buffer
-                                                          │
-                                       (sampler generates 2 s every 5 s)
-                                                          ▼
-            game  ◀── INJECT predicted 2 s ◀── decode key/mouse ◀── on_output(fd)
- 
-Two halves, both reusing code that already exists in this repo:
- 
-  ENCODE half  (ingest_window):
-    * keys + mouse: reuse data_preprocessor.preprocess_data + encode_key_press
-      (they already emit the model's exact (16,5) keypress latents into a DB and
-      bin mouse the way the model's dataset expects)
-    * video: a PRELOADED SDXL VAE + the repo's own encode_latents()
-    * assemble each 200 ms unit into a FullData dataframe with the EXACT shapes
-      the model's collate produces, then push to sampler.push_dataframe()
- 
-  INJECT half  (_on_sampler_output):
-    * reuse decode.decode_keypress_latents (AE decoder -> 79x10 -> threshold ->
-      key/mouse-button events) and decode_mouse_movement (dx/dy)
-    * drive the game via inputInjector.make_backend() + replay_keys / replay_mouse
- 
-------------------------------------------------------------------------------
-RUNNING (single process, in the model's venv, e.g. ~/plaicraft-env):
- 
-  export PLAICRAFT_MODEL_REPO=/mnt/c/Users/DougJohn/Documents/GitHub/plaicraft-model-pi0
-  export PLAICRAFT_CKPT="$PLAICRAFT_MODEL_REPO/last_fp32/pytorch_model.bin"
-  # online_sampler.py must live in $PLAICRAFT_MODEL_REPO (repo root)
-  cd /path/to/AgentDeployer
-  python minecraft_input_recorder.py     # now drives live_agent (see the patch)
- 
-Verify the encoder matches the offline path BEFORE going live:
-  python -c "import live_agent; live_agent.self_check()"
-------------------------------------------------------------------------------
-"""
-from __future__ import annotations
- 
 import os
 import sys
-import json
+import importlib
 import time
-import pickle
-import threading
-import traceback
-import os
-import torch
 from pathlib import Path
-from dotenv import load_dotenv
-import scripts_replay.inputInjector
- 
+import threading
+import time
+import traceback
+import gc
+import hydra
+from hydra import compose, initialize_config_dir
+import torch
+from diffusers import AutoencoderTiny
+from encodec import EncodecModel as _EncodecPkg
 import numpy as np
 
-load_dotenv()
- 
+import cv2
+from PIL import Image
+from torchvision.transforms import functional as F
+
+import scripts_replay.inputInjector as inputInjector
+import decode.decode_keypress_latents as dkl
+
+
 # --------------------------------------------------------------------------- #
 # Path wiring: this repo + the model repo (src-layout) + online_sampler.py
 # --------------------------------------------------------------------------- #
 AGENT_DIR = Path(__file__).resolve().parent
 MODEL_REPO = Path(os.environ.get("PLAICRAFT_MODEL_REPO")).expanduser()
+sys.path.append(str(MODEL_REPO))
+from src.data.data_classes import FullData
+
 CKPT = os.environ.get("PLAICRAFT_CKPT")
+STEPS = int(os.environ.get("PLAICRAFT_DENOISE_STEPS", 8))
+CHUNK_LEN = int(os.environ.get("PLAICRAFT_CHUNK_LEN", 5))
+DTYPE = os.environ.get("PLAICRAFT_DTYPE").lower()
+TARGET_MODALITIES = os.environ.get("PLAICRAFT_TARGET_MODALITIES")
+VAE_MODE = os.environ.get("PLAICRAFT_VAE", "sdxl").lower()
+PROFILE_VAE = os.environ.get("PLAICRAFT_PROFILE", "0").lower() in ("1", "true", "yes")
+
+VAE_BATCH_SIZE = os.environ.get("PLAICRAFT_VAE_BATCH_SIZE", 2)
  
 for p in (str(AGENT_DIR), str(MODEL_REPO), str(MODEL_REPO / "src")):
     if p and p not in sys.path:
@@ -92,13 +67,14 @@ AUDIO_FEATURE_DIM      = 128
 AUDIO_SAMPLES_PER_UNIT = AUDIO_SR // 5   # 4800 samples per 200 ms unit
  
 # Filled in by init().
-_S: dict = {}
- 
- 
+_S: dict = dict.fromkeys(['torch', 'sampler', 'vae', 'ae', 'dkl', 'vae_fast', 'vae_mode', 'vae_calib', 'id_to_index', 
+                          'id_to_name', 'held_keys', 'held_clicks', 'backend', 'inputInjector', 'device', 'sampler_thread'], 'Unknown')
+
+
 # --------------------------------------------------------------------------- #
 # INIT — load everything once, start the sampler thread
 # --------------------------------------------------------------------------- #
-def init(device: str = "cuda", num_denoising_steps: int = 50, make_backend: bool = True):
+def init(device: str = "cuda", make_backend: bool = True):
     """Preload model + VAE + keypress AE; start the sampler loop.
  
     on_output(fd): called with each 2 s rollout. Defaults to local injection.
@@ -107,7 +83,6 @@ def init(device: str = "cuda", num_denoising_steps: int = 50, make_backend: bool
     make_backend:  build a local input backend (pydirectinput/uinput). Set False
                    on a headless server that only decodes + forwards.
     """
-    import torch
     from omegaconf import OmegaConf
     from diffusers import AutoencoderKL
  
@@ -119,7 +94,6 @@ def init(device: str = "cuda", num_denoising_steps: int = 50, make_backend: bool
     if not CKPT or not Path(CKPT).is_file():
         raise RuntimeError("Set PLAICRAFT_CKPT to your pytorch_model.bin checkpoint.")
  
-    from online_sampler import OnlineSampler  # lives in the model repo root
  
     dev = device if torch.cuda.is_available() else "cpu"
     print(f"[live_agent] device = {dev}")
@@ -150,132 +124,86 @@ def init(device: str = "cuda", num_denoising_steps: int = 50, make_backend: bool
         # that, so every tick recompiles (2 s/step instead of ~0.5 s). Raise the
         # limits so all the shapes stay cached and steps run at the GPU's real speed after a one-time warmup.
         try:
-            import torch._dynamo
-            torch._dynamo.config.cache_size_limit = 256
-            torch._dynamo.config.accumulated_cache_size_limit = 512
+            import torch._dynamo as _dynamo
+            _dynamo.config.cache_size_limit = 256
+            _dynamo.config.accumulated_cache_size_limit = 512
         except Exception:
             pass
         print("[live_agent] TF32 enabled; dynamo cache limit raised")
  
     # --- the world model + streaming sampler -------------------------------- #
     model, inf_cfg = _load_model(CKPT, dev)
-    steps = int(os.environ.get("PLAICRAFT_DENOISE_STEPS", num_denoising_steps))
-    chunk_len = int(os.environ.get("PLAICRAFT_CHUNK_LEN", ))
     OmegaConf.set_struct(inf_cfg, False)        # allow adding/overriding keys
-    inf_cfg.num_denoising_steps = steps         # generate_chunk reads this exact key
-    inf_cfg.chunk_length = chunk_len
-    print(f"[live_agent] num_denoising_steps = {steps}")
-    print(f"[live_agent] num_chunk_len = {inf_cfg.chunk_length}")
+    inf_cfg.num_denoising_steps = STEPS         # generate_chunk reads this exact key
+    inf_cfg.chunk_length = CHUNK_LEN
+    print(f"[live_agent] num_denoising_steps = {STEPS }")
+    print(f"[live_agent] num_chunk_len = {CHUNK_LEN}")
  
     # Optional native bf16 inference (the model was TRAINED in bf16 under DeepSpeed;
     # min_gru/LayerNorm/MPConv all upcast their fragile math to fp32 internally, so
     # bf16 weights are the native regime, ~2x the fp32 decoder). Opt-in via env.
-    _dtype = os.environ.get("PLAICRAFT_DTYPE").lower()
-    if _dtype in ("bf16", "bfloat16") and str(dev).startswith("cuda"):
-        model = model.to(torch.bfloat16)
-        print("[live_agent] world model cast to bf16")
+    #if DTYPE in ("bf16", "bfloat16") and str(dev).startswith("cuda"):
+     #   model = model.to(torch.bfloat16)
+     #   print("[live_agent] world model cast to bf16")
  
-    # The output path (_decode_prediction) only consumes key_press + mouse_movement
-    # and never decodes predicted video, so by default we DON'T denoise video --
-    # that's ~94% of the target tokens generated and thrown away. STM still carries
-    # the full real video history, so the model is still conditioned on what it sees;
-    # it just predicts actions instead of pixels. Set PLAICRAFT_TARGET_MODALITIES=
-    # "video,key_press,mouse_movement" to restore joint video generation.
-    _tm_env = os.environ.get("PLAICRAFT_TARGET_MODALITIES")
-    target_modalities = [m.strip() for m in _tm_env.split(",") if m.strip()]
+    # Setup the online sampler
+    target_modalities = [m.strip() for m in TARGET_MODALITIES.split(",") if m.strip()]
     print(f"[live_agent] target_modalities = {target_modalities}")
+    from online_sampler import OnlineSampler  # lives in the model repo root
     sampler = OnlineSampler(
         model, inf_cfg,
         target_modalities=target_modalities,
         device=dev,
     )
 
-    # --- audio context encoder (Encodec 24kHz). Matches the corpus builder
+    # --- load the audio context encoder to the gpu(Encodec 24kHz). Matches the corpus builder
     #     main_continuous_hdf5.py exactly (no set_target_bandwidth); the
-    #     encode -> quantizer.decode round-trip lives in _encode_audio_inmemory.
-    from encodec import EncodecModel as _EncodecPkg
-    _S["encodec"] = _EncodecPkg.encodec_model_24khz().to(dev).eval()
+    #     encode -> quantizer.decode round-trip lives in _encode_audio_inmemory. 
+    encodec = _EncodecPkg.encodec_model_24khz().to(dev).eval()
     print("[live_agent] Encodec audio context encoder loaded")
  
-    # --- SDXL VAE for live video encode (loaded ONCE; the repo's encoder
-    #     reloads it every call, which is far too slow for a live loop) ------- #
+    # --- load the SDXL VAE for live video encode 
     vae = AutoencoderKL.from_pretrained(
         "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16
     ).to(dev).eval()
     try:
-        vae = vae.to(memory_format=torch.channels_last)   # faster conv kernels
+        #vae = vae.to(memory_format=torch.channels_last)   # faster conv kernels
+        vae = vae.half()
     except Exception:
         print ("[live_agent] faster conversion kernels failed")
-        pass
-    
-    # --- optional: torch.compile the SDXL encoder (~1.3-1.8x). Compile the
-    #     ENCODER submodule, not the AutoencoderKL: vae.forward is the
-    #     encode->decode roundtrip we never call, and vae.encode() returns a
-    #     DiagonalGaussianDistribution that graph-breaks. The conv stack is ~all
-    #     the compute. Warm it up here so the first live frame doesn't stall. ---
-    if str(dev).startswith("cuda") and os.environ.get("PLAICRAFT_VAE_COMPILE", "0").lower() in ("1", "true", "yes"):
-        try:
-            vae.encoder = torch.compile(
-                vae.encoder,
-                mode="default",             # best kernels; cudagraphs are
-                                                    # fragile with fresh-allocated
-                                                    # inputs each call
-                fullgraph=True,                     # drop this if it raises on a
-                                                    # graph break
-            )
-            # Warm up EVERY batch size the chunk loop can hand it, so none
-            # recompiles mid-stream. Your live path encodes 2 frames/unit; the
-            # clip path chunks by 8 with a ragged tail. Warm 8, 2, 1 (cheap vs.
-            # one mid-loop recompile, and the dynamo cache holds 256).
-            with torch.inference_mode():
-                dummy = torch.zeros(
-                    8, 3, PAD_FRAME_WH[1], PAD_FRAME_WH[0],
-                    device=dev, dtype=torch.float16,
-                    ).to(memory_format=torch.channels_last)
-                vae.encode(2 * dummy - 1).latent_dist.sample()
-            torch.cuda.synchronize()
-            print("[live_agent] SDXL VAE encoder compiled + warmed up")
-        except Exception as e:
-            print(f"[live_agent] VAE compile failed ({e}); falling back to eager")
     
     # --- optional FAST VAE (TAESDXL): a tiny distilled autoencoder that produces
     #     SDXL-compatible latents ~100x faster than the full SDXL VAE. The full VAE
-    #     encode (~490 ms/frame on a 3060) is the live loop's true bottleneck; this
-    #     replaces it. We keep the SDXL VAE around for a one-time per-channel
+    #     encode (~390 ms/frame on a 3060) is the live loop's true bottleneck.
+    #     We keep the SDXL VAE around for a one-time per-channel
     #     calibration (see _encode_frames) so the tiny VAE's latents are mapped onto
     #     the exact distribution the world model trained on, then free it. ------- #
-    vae_mode = os.environ.get("PLAICRAFT_VAE", "sdxl").lower()
     vae_fast = None
-    if vae_mode in ("fast", "taesd", "taesdxl", "tiny"):
-        from diffusers import AutoencoderTiny
+    if VAE_MODE in ("fast", "taesd", "taesdxl", "tiny"):
         vae_fast = AutoencoderTiny.from_pretrained(
             "madebyollin/taesdxl", torch_dtype=torch.float16
         ).to(dev).eval()
         try:
-            vae_fast = vae_fast.to(memory_format=torch.channels_last)
+            #vae = vae.to(memory_format=torch.channels_last)   # faster conv kernels
+            pass
         except Exception:
             pass
         print("[live_agent] fast VAE (TAESDXL) loaded; will calibrate on first frame")
  
-    # --- keypress AE for BOTH directions (encode + decode); loaded once ----- #
-    from plaicraft_model.decode import decode_keypress_latents as dkl
-    ae = dkl.build_autoencoder(dkl.CHECKPOINT_DIR, device="cpu")
-    index_to_name, mouse_indices = dkl.load_name_maps()
-    # forward map (key_id/button -> channel index) for in-memory encoding
-    from plaicraft_model.encode_key_press.scripts.constants import id_to_index, id_to_name
+    # --- keypress AE for BOTH directions (encode + decode); loaded once -----  #
+    ae = dkl._build_autoencoder(dkl.CHECKPOINT_DIR, device=dev)
+    # --- forward map (key_id/button -> channel index) for in-memory encoding-- #
+    from encode_key_press.scripts.constants import id_to_index, id_to_name
  
     # --- input backend (only when injecting locally; skip on a server) ------- #
     backend = None
-    inputInjector = None
     if make_backend:
-        import scripts_replay.inputInjector as inputInjector
-        backend = inputInjector.make_backend()
+        backend = inputInjector.init_injector()
  
     _S.update(
-        torch=torch, sampler=sampler, vae=vae, ae=ae, dkl=dkl,
+        torch=torch, sampler=sampler, vae=vae, encodec=encodec, ae=ae, dkl=dkl,
         vae_fast=vae_fast, vae_mode=("fast" if vae_fast is not None else "sdxl"),
         vae_calib=None,   # (scale[4,1,1], bias[4,1,1]) fitted on first encode
-        index_to_name=index_to_name, mouse_indices=mouse_indices,
         id_to_index=id_to_index, id_to_name=id_to_name,
         held_keys={}, held_clicks={},   # carried across windows
         backend=backend, inputInjector=inputInjector, device=dev,
@@ -287,34 +215,44 @@ def init(device: str = "cuda", num_denoising_steps: int = 50, make_backend: bool
     t.start()
     _S["sampler_thread"] = t
     print("[live_agent] ready — sampler loop started.")
-    return _S
  
- 
-def _encode_audio_inmemory(pcm_hear, pcm_speak):
-    """Two mono 24kHz float32 clips (~4800 samples) -> two (15,128) arrays,
-    matching main_continuous_hdf5.py: encode -> quantizer.decode -> (T,128)."""
-    import torch
-    enc = _S["encodec"]
-    def _emb(pcm):
-        x = torch.as_tensor(pcm, dtype=torch.float32, device=_S["device"]).flatten()
-        n = AUDIO_SAMPLES_PER_UNIT
-        x = torch.nn.functional.pad(x, (0, n - x.numel())) if x.numel() < n else x[:n]
-        frames = enc.encode(x.view(1, 1, n))            # [(codes, scale)], codes:(1,K,T)
-        zs = []
-        for code, _scale in frames:
-            z = enc.quantizer.decode(code.transpose(0, 1))   # (1,128,T)  <-- the key step
-            zs.append(z)
-        z = torch.cat(zs, dim=-1).squeeze(0).transpose(0, 1).contiguous()  # (T,128)
-        if z.shape[0] < AUDIO_TOKENS_PER_UNIT:
-            z = torch.nn.functional.pad(z, (0, 0, 0, AUDIO_TOKENS_PER_UNIT - z.shape[0]))
-        return z[:AUDIO_TOKENS_PER_UNIT].float().cpu().numpy()   # (15,128)
-    return _emb(pcm_hear), _emb(pcm_speak)
- 
- 
+def _load_model(ckpt_path, device):
+    """Mirror online_sampler.load_model but with an explicit config dir, and a
+    memory-frugal load (the fp32 1.7B checkpoint is ~7 GB; we avoid holding two
+    copies in RAM at once)."""
+    with initialize_config_dir(config_dir=str(MODEL_REPO / "configs"), version_base=None):
+        cfg = compose(config_name="eval", overrides=[
+            "model=plai_v1_trained",
+            "model.context_modalities=[video,audio_hear,audio_speak,key_press,mouse_movement]",
+            "model.target_modalities=[video,audio_hear,audio_speak,key_press,mouse_movement]",
+            ])
+    # Instantiate, then move to the GPU FIRST so the CPU copy is freed before we
+    # read the checkpoint — otherwise model (CPU) + checkpoint (CPU) = 2x ~7 GB.
+    model = hydra.utils.instantiate(cfg.model).to(device).eval()
+    gc.collect()
+    # Load the checkpoint
+    sd = _torch_load_low_mem(ckpt_path)
+    # The for loop is filtering out unwanted string prefixes from the 
+    # weight names (keys) so they perfectly match the model definition
+    sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
+    clean = {}
+    for k, v in sd.items():
+        # pre looks for three common wrappers
+        for pre in ("module.model.", "model.", "module."):
+            if k.startswith(pre):
+                k = k[len(pre):]; break
+        clean[k] = v
+    miss, unexp = model.load_state_dict(clean, strict=False)   # mmap source -> GPU
+    del sd, clean
+    gc.collect()
+    if str(device).startswith("cuda"):
+        torch.cuda.empty_cache()
+    print(f"[live_agent] model loaded ({len(miss)} missing / {len(unexp)} unexpected keys)")
+    return model, cfg.inference
+
 def _torch_load_low_mem(ckpt_path):
     """Load a big checkpoint without copying the whole thing into RAM.
     mmap=True keeps weights file-backed (low CPU peak); fall back gracefully."""
-    import torch
     attempts = (
         dict(map_location="cpu", mmap=True, weights_only=True),
         dict(map_location="cpu", mmap=True, weights_only=False),
@@ -329,236 +267,20 @@ def _torch_load_low_mem(ckpt_path):
             last = e
     raise last
  
- 
-def _load_model(ckpt_path, device):
-    """Mirror online_sampler.load_model but with an explicit config dir, and a
-    memory-frugal load (the fp32 1.7B checkpoint is ~7 GB; we avoid holding two
-    copies in RAM at once)."""
-    import gc
-    import torch, hydra
-    from hydra import compose, initialize_config_dir
-    with initialize_config_dir(config_dir=str(MODEL_REPO / "configs"), version_base=None):
-        cfg = compose(config_name="eval", overrides=[
-            "model=plai_v1_trained",
-            "model.context_modalities=[video,audio_hear,audio_speak,key_press,mouse_movement]",
-            "model.target_modalities=[video,audio_hear,audio_speak,key_press,mouse_movement]",
-        ])
-    # Instantiate, then move to the GPU FIRST so the CPU copy is freed before we
-    # read the checkpoint — otherwise model (CPU) + checkpoint (CPU) = 2x ~7 GB.
-    model = hydra.utils.instantiate(cfg.model).to(device).eval()
-    gc.collect()
-    sd = _torch_load_low_mem(ckpt_path)
-    sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
-    clean = {}
-    for k, v in sd.items():
-        for pre in ("module.model.", "model.", "module."):
-            if k.startswith(pre):
-                k = k[len(pre):]; break
-        clean[k] = v
-    miss, unexp = model.load_state_dict(clean, strict=False)   # mmap source -> GPU
-    del sd, clean
-    gc.collect()
-    if str(device).startswith("cuda"):
-        torch.cuda.empty_cache()
-    print(f"[live_agent] model loaded ({len(miss)} missing / {len(unexp)} unexpected keys)")
-    return model, cfg.inference
- 
-# --------------------------------------------------------------------------- #
-# ENCODE HALF — capture window -> dataframes -> ring buffer
-# --------------------------------------------------------------------------- #
-def ingest_window(mouse_events, click_events, key_events, clip_path):
-    """Push one captured window to the model's ring buffer.
- 
-    mouse_events / click_events / key_events are the RAW lists of dicts the
-    recorder already holds (JSON strings are still
-    accepted for backward compatibility.)
-    """
-    def _as_list(x):
-        return json.loads(x) if isinstance(x, str) else (x or [])
-    try:
-        _ingest_window(_as_list(mouse_events), _as_list(click_events),
-                       _as_list(key_events), Path(clip_path))
-    except Exception:
-        print("[live_agent] ingest_window failed:")
-        traceback.print_exc()
- 
- 
-def _ingest_window(mouse_events, click_events, key_events, clip_path: Path):
-    # 1) Video first (its frame count defines the window's coverage). Preloaded VAE.
-    video = _encode_video(clip_path)                 # (F,4,96,160) np.float32
-    n_video = video.shape[0]
-    if n_video < VIDEO_FRAMES_PER_UNIT:
-        print("[live_agent] window too short to form a 200ms unit; skipped.")
-        return
- 
-    # 2) Shared t0 = earliest mouse timestamp (matches the offline trim_start).
-    if mouse_events:
-        t0 = min(int(e["timestamp"]) for e in mouse_events)
-    elif key_events:
-        t0 = min(int(e["timestamp"]) for e in key_events)
-    else:
-        print("[live_agent] no input events in window; skipped.")
-        return
- 
-    n_frames = n_video                               # one 100 ms frame per latent
-    # 3) keys+clicks -> (16,5) per frame, straight from raw events (no JSON/DB).
-    key_by_frame = _encode_keys_inmemory(key_events, click_events, t0, n_frames)
-    # 4) mouse -> (2,10) per frame, binned + clipped exactly like the dataset.
-    mouse_by_frame = _mouse_bins_inmemory(mouse_events, t0, n_frames)
- 
-    n_units = n_frames // VIDEO_FRAMES_PER_UNIT
-    pushed = 0
-    for u in range(n_units):
-        fd = _assemble_dataframe(u, video, key_by_frame, mouse_by_frame)
-        _S["sampler"].push_dataframe(fd)
-        pushed += 1
-    print(f"[live_agent] pushed {pushed} dataframes "
-          f"({pushed*DATAFRAME_MS/1000:.1f}s) to the ring buffer.")
- 
- 
-def _encode_frames(frames_bgr) -> np.ndarray:
-    """Encode a list of BGR frames (any size) with the preloaded VAE.
-    Resizes to the training resolution, letterbox-pads 720->768, returns
-    (N,4,96,160) float32. Shared by the clip path and the live stream path."""
-    import cv2
-    import torch
-    from torchvision.transforms import functional as TF
-    from PIL import Image
- 
-    if not frames_bgr:
-        return np.zeros((0, *VIDEO_LATENT_SHAPE), dtype=np.float32)
- 
-    pad_top = (PAD_FRAME_WH[1] - ENCODE_FRAME_WH[1]) // 2
-    batch = []
-    for f in frames_bgr:
-        if (f.shape[1], f.shape[0]) != ENCODE_FRAME_WH:
-            f = cv2.resize(f, ENCODE_FRAME_WH)
-        rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-        t = TF.to_tensor(TF.pad(Image.fromarray(rgb), (0, pad_top), fill=0))
-        batch.append(t.half())
-    imgs = torch.stack(batch).to(_S["device"]).to(memory_format=torch.channels_last)
- 
-    lat = []
-    import time as _time
-    _vae_prof = os.environ.get("PLAICRAFT_PROFILE", "0").lower() in ("1", "true", "yes")
-    if _vae_prof and torch.cuda.is_available():
-        torch.cuda.synchronize(); _vt0 = _time.time()
-    if _S.get("vae_mode") == "fast" and _S.get("vae_fast") is not None:
-        out = _encode_frames_fast(imgs)
-    else:
-        bs = 8
-        with torch.inference_mode():
-            for i in range(0, imgs.shape[0], bs):
-                chunk = imgs[i:i + bs]
-                real = chunk.shape[0]
-                if real < bs:
-                    # Pad the ragged tail up to the fixed batch so the compiled
-                    # encoder sees ONE shape (no recompiles). Pad rows are dropped
-                    # below. .contiguous(channels_last) keeps the memory format
-                    # identical to what compile traced during warmup.
-                    pad = imgs.new_zeros((bs - real, *chunk.shape[1:]))
-                    chunk = torch.cat([chunk, pad], 0) \
-                                 .contiguous(memory_format=torch.channels_last)
-                z = _S["vae"].encode(2 * chunk - 1).latent_dist.sample() * 0.13025
-                lat.append(z[:real].float().cpu())   # slice off the pad rows
-        out = torch.cat(lat, 0).numpy()
-    if _vae_prof and torch.cuda.is_available():
-        torch.cuda.synchronize()
-        _dt = (_time.time() - _vt0) * 1000
-        print(f"[profile] VAE encode {imgs.shape[0]} frame(s) = {_dt:.0f}ms "
-              f"({_dt / max(imgs.shape[0], 1):.0f}ms/frame)", flush=True)
-    return out
- 
- 
-def _encode_frames_fast(imgs) -> np.ndarray:
-    """Encode with TAESDXL (tiny VAE). On the first call, fit a per-channel
-    scale+bias mapping TAESDXL latents -> the SDXL-VAE latent distribution the
-    world model trained on (z = vae.encode(2x-1).sample()*0.13025), using the SDXL
-    VAE that's still loaded; then free the SDXL VAE. After that it's pure TAESDXL +
-    an elementwise affine -- single-digit ms/frame."""
-    import torch
-    taesd = _S["vae_fast"]
- 
-    def _tae_latents(x01):
-        zs = []
-        with torch.inference_mode():
-            for i in range(0, x01.shape[0], 8):
-                z = taesd.encode(2 * x01[i:i + 8] - 1).latents   # diffusers remaps internally
-                zs.append(z)
-        return torch.cat(zs, 0)
- 
-    if _S.get("vae_calib") is None and _S.get("vae") is not None:
-        with torch.inference_mode():
-            z_sdxl = []
-            for i in range(0, imgs.shape[0], 8):
-                z = _S["vae"].encode(2 * imgs[i:i + 8] - 1).latent_dist.sample() * 0.13025
-                z_sdxl.append(z.float())
-            z_sdxl = torch.cat(z_sdxl, 0)                          # (N,4,96,160)
-        z_tae = _tae_latents(imgs).float()
-        dims = (0, 2, 3)                                           # per-channel moment match
-        mu_s = z_sdxl.mean(dims, keepdim=True); sd_s = z_sdxl.std(dims, keepdim=True)
-        mu_t = z_tae.mean(dims, keepdim=True);  sd_t = z_tae.std(dims, keepdim=True)
-        scale = sd_s / (sd_t + 1e-6)
-        bias = mu_s - scale * mu_t
-        _S["vae_calib"] = (scale, bias)
-        print(f"[live_agent] TAESDXL calibrated to SDXL latents "
-              f"(per-channel scale {[round(v,3) for v in scale.flatten().tolist()]})", flush=True)
-        try:
-            _S["vae"] = None
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
- 
-    scale, bias = _S["vae_calib"]
-    z = _tae_latents(imgs).float()
-    z = z * scale.to(z.device) + bias.to(z.device)
-    return z.cpu().numpy()
- 
- 
-def _encode_video(clip_path: Path) -> np.ndarray:
-    """Read a window clip, take every Nth frame for 10 fps, encode (batch path)."""
-    import cv2
-    cap = cv2.VideoCapture(str(clip_path))
-    src_fps = cap.get(cv2.CAP_PROP_FRAME_COUNT) and (cap.get(cv2.CAP_PROP_FPS) or 30.0)
-    step = max(1, int(round((src_fps or 30.0) / LATENT_FPS)))   # 30fps -> every 3rd
-    frames, idx = [], 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if idx % step == 0:
-            frames.append(frame)
-        idx += 1
-    cap.release()
-    return _encode_frames(frames)
- 
- 
-def _intervals_from_events(events, held, t_end):
-    """events: list of (id_str, 'PRESS'|'RELEASE', ts_ms). Pair into
-    (id, start_ms, end_ms) intervals. `held` (mutated) carries ids still down
-    ACROSS flushes, so a key held over a 5 s boundary isn't lost the way the
-    offline PRESS/RELEASE-in-one-batch pairing loses it. Anything still held at
-    t_end gets an open interval to t_end and stays held for the next window."""
-    intervals = []
-    for ids, act, ts in sorted(events, key=lambda x: x[2]):
-        if act == "PRESS":
-            held.setdefault(ids, int(ts))
-        elif act == "RELEASE":
-            if ids in held:
-                intervals.append((ids, held.pop(ids), int(ts)))
-    for ids, st in held.items():
-        intervals.append((ids, st, t_end))
-    return intervals
+
+def encode_keys_inmemory(key_events, click_events, t0, n_frames):
+    """Raw key/click events -> (n_frames,79,10) -> {frame_idx: (16,5)} float32 CUDA tensors
+    via the preloaded AE."""
+    frames = _keys_to_multihot(key_events, click_events, t0, n_frames)
+    #  disable gradient calculation, which saves memory and speeds up computations
+    with torch.no_grad():
+        z = _S["ae"].encoder(torch.from_numpy(frames).to(_S["device"]))   # (n_frames,16,5)
+    z = z.float()
+    return {i: z[i] for i in range(n_frames)}
  
  
 def _keys_to_multihot(key_events, click_events, t0, n_frames):
-    """Raw key/click events -> (n_frames, 79, 10) float32 multi-hot.
- 
-    Byte-for-byte port of the offline KeyPressDataset featurization (same 100 ms
-    windows, same `start<bin_end and end>bin_start` overlap test, same
-    id_to_index / scroll handling). Split out from the AE encode so it can be
-    unit-tested against the offline path with no torch dependency.
-    """
+    """Turns discrete input events into a dense (n_frames, 79, 10) array:."""
     id_to_index = _S["id_to_index"]
     id_to_name = _S["id_to_name"]
     frame_ms = 1000.0 / LATENT_FPS                 # 100 ms
@@ -599,20 +321,27 @@ def _keys_to_multihot(key_events, click_events, t0, n_frames):
                     frames[i, idx, t] = 1.0
     return frames
  
- 
-def _encode_keys_inmemory(key_events, click_events, t0, n_frames):
-    """Raw key/click events -> {frame_idx: (16,5)} via the preloaded AE
-    (no JSON, no SQLite, no per-call AE reload)."""
   
-    frames = _keys_to_multihot(key_events, click_events, t0, n_frames)
-    with torch.no_grad():
-        z = _S["ae"].encoder(torch.from_numpy(frames)).cpu().numpy()   # (n_frames,16,5)
-    return {i: z[i] for i in range(n_frames)}
- 
- 
-def _mouse_bins_inmemory(mouse_events, t0, n_frames):
-    """Raw mouse-movement events -> {frame_idx: (2,10)}, binned + outlier-clipped
-    exactly like the model dataset's _load_mouse_movement (no DB)."""
+def _intervals_from_events(events, held, t_end):
+    """events: list of (id_str, 'PRESS'|'RELEASE', ts_ms). Pair into
+    (id, start_ms, end_ms) intervals. `held` (mutated) carries ids still down
+    ACROSS flushes, so a key held over a 5 s boundary isn't lost the way the
+    offline PRESS/RELEASE-in-one-batch pairing loses it. Anything still held at
+    t_end gets an open interval to t_end and stays held for the next window."""
+    intervals = []
+    for ids, act, ts in sorted(events, key=lambda x: x[2]):
+        if act == "PRESS":
+            held.setdefault(ids, int(ts))
+        elif act == "RELEASE":
+            if ids in held:
+                intervals.append((ids, held.pop(ids), int(ts)))
+    for ids, st in held.items():
+        intervals.append((ids, st, t_end))
+    return intervals
+
+
+def mouse_bins_inmemory(mouse_events, t0, n_frames) -> dict[int, np.ndarray]:
+    """Raw mouse-movement events -> {frame_idx: (2,10)}, binned + outlier-clipped."""
     out = {}
     frame_len = 1000.0 / LATENT_FPS                # 100 ms
     bin_w = frame_len / BINS_PER_FRAME             # 10 ms
@@ -621,8 +350,11 @@ def _mouse_bins_inmemory(mouse_events, t0, n_frames):
         dt = int(e["timestamp"]) - t0
         if dt < 0 or dt >= horizon:
             continue
+        # which frame the event falls in 
         fi = int(dt // frame_len)
+        # which sub-bin  within the frame it falls in
         b = min(max(int((dt - fi * frame_len) // bin_w), 0), BINS_PER_FRAME - 1)
+        # Fetch (or create) the (2, 10) array for this frame, then accumulate the event's deltas: mouseDX into row 0 at sub-bin b, mouseDY into row 1.
         f = out.setdefault(fi, np.zeros((2, BINS_PER_FRAME), dtype=np.float32))
         f[0, b] += float(e.get("mouseDX", 0.0))
         f[1, b] += float(e.get("mouseDY", 0.0))
@@ -630,23 +362,138 @@ def _mouse_bins_inmemory(mouse_events, t0, n_frames):
         f[0][(f[0] < CLIP_MOUSE_DX[0]) | (f[0] > CLIP_MOUSE_DX[1])] = 0.0
         f[1][(f[1] < CLIP_MOUSE_DY[0]) | (f[1] > CLIP_MOUSE_DY[1])] = 0.0
     return out
+
+
+def encode_frames(frames_bgr) -> torch.Tensor:
+    """Encode a list of BGR frames (any size) with the preloaded VAE.
+    Resizes to the training resolution, letterbox-pads 720->768, returns
+    (N,4,96,160) float32"""
+    if not frames_bgr:
+        return torch.zeros((0, *VIDEO_LATENT_SHAPE), dtype=torch.float32, device="cuda")
+
+    # Preprocessing
+    imgs = pad_and_transform_frames(frames_bgr, True, ENCODE_FRAME_WH, PAD_FRAME_WH).to("cuda")
  
+    # Sets up an empty list to collect latent chunks. 
+    lat = []
+    if PROFILE_VAE  and torch.cuda.is_available():
+        torch.cuda.synchronize(); _vt0 = time.time()
+    if _S.get("vae_mode") == "fast" and _S.get("vae_fast") is not None:
+        out = _encode_frames_fast(imgs)
+    else:
+        with torch.inference_mode():         # inference_mode() is like no_grad() but stricter/faster — no autograd tracking at all, no version counters.
+            # Processes frames in batches of VAE_BATCH_SIZE to avoid running out of GPU memory when many frames come in at once.
+            #       2 * chunk - 1 — rescales pixel values from [0, 1] to [-1, 1], the range the VAE was trained on.
+            #       .latent_dist.sample() — the VAE encoder outputs a distribution (mean + variance per latent), and this draws a sample from it rather than taking the mean.
+            #       * 0.13025 — the VAE scaling factor, which normalizes latents to roughly unit variance. This is the SDXL VAE's constant, so this is almost certainly the SDXL autoencoder (SD 1.5's is 0.18215).
+            for i in range(0, imgs.shape[0], VAE_BATCH_SIZE ):
+                chunk = imgs[i:i + VAE_BATCH_SIZE ]
+                z = _S["vae"].encode(2 * chunk - 1).latent_dist.sample() * 0.13025
+                lat.append(z.float())   # Casts to float32 (the VAE may run in fp16) and copies the latents from GPU to CPU, appending each chunk. 
+        out = torch.cat(lat, 0)         # Concatenates all chunks along the batch dimension and converts to a numpy array.
+    if PROFILE_VAE and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        _dt = (time.time() - _vt0) * 1000
+        print(f"[profile] VAE encode {imgs.shape[0]} frame(s) = {_dt:.0f}ms "
+              f"({_dt / max(imgs.shape[0], 1):.0f}ms/frame)", flush=True)
+    return out
  
-def _assemble_dataframe(u, video, key_by_frame, mouse_by_frame,  audio_hear=None, audio_speak=None):
+def _encode_frames_fast(imgs) -> torch.Tensor:
+    """Encode with TAESDXL (tiny VAE). On the first call, fit a per-channel
+    scale+bias mapping TAESDXL latents -> the SDXL-VAE latent distribution the
+    world model trained on (z = vae.encode(2x-1).sample()*0.13025), using the SDXL
+    VAE that's still loaded; then free the SDXL VAE. After that it's pure TAESDXL +
+    an elementwise affine -- single-digit ms/frame. Returns float32 CUDA tensor."""
+    taesd = _S["vae_fast"]
+
+    def _tae_latents(x01):
+        zs = []
+        with torch.inference_mode():
+            for i in range(0, x01.shape[0], 8):
+                z = taesd.encode(2 * x01[i:i + 8] - 1).latents   # diffusers remaps internally
+                zs.append(z)
+        return torch.cat(zs, 0)
+
+    if _S.get("vae_calib") is None and _S.get("vae") is not None:
+        with torch.inference_mode():
+            z_sdxl = []
+            for i in range(0, imgs.shape[0], 8):
+                z = _S["vae"].encode(2 * imgs[i:i + 8] - 1).latent_dist.sample() * 0.13025
+                z_sdxl.append(z.float())
+            z_sdxl = torch.cat(z_sdxl, 0)                          # (N,4,96,160)
+        z_tae = _tae_latents(imgs).float()
+        dims = (0, 2, 3)                                           # per-channel moment match
+        mu_s = z_sdxl.mean(dims, keepdim=True); sd_s = z_sdxl.std(dims, keepdim=True)
+        mu_t = z_tae.mean(dims, keepdim=True);  sd_t = z_tae.std(dims, keepdim=True)
+        scale = sd_s / (sd_t + 1e-6)
+        bias = mu_s - scale * mu_t
+        _S["vae_calib"] = (scale.to(imgs.device), bias.to(imgs.device))   # keep calib on GPU
+        print(f"[live_agent] TAESDXL calibrated to SDXL latents "
+              f"(per-channel scale {[round(v,3) for v in scale.flatten().tolist()]})", flush=True)
+        try:
+            _S["vae"] = None
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    scale, bias = _S["vae_calib"]
+    z = _tae_latents(imgs).float()
+    return z * scale + bias                                        # stays on GPU
+ 
+def pad_and_transform_frames(frames, use_fp16, original_frame_size, padded_frame_size):
+    """Preprocessing: resizes frames to the training resolution, 
+    letterbox-pads the height from 720 to 768 (VAEs typically need dimensions divisible by 8 or 64, and 720 isn't divisible by 64 — 768 is), c
+    onverts to a torch tensor, and moves it onto the GPU."""
+    padding = (0, (padded_frame_size[1] - original_frame_size[1]) // 2) 
+    return torch.stack([
+        F.to_tensor(
+            F.pad(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), padding, fill=0)
+        ).half() if use_fp16 else F.to_tensor(
+            F.pad(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), padding, fill=0)
+        )
+        for frame in frames
+    ])
+
+ 
+def encode_audio_inmemory(pcm_hear, pcm_speak) -> torch.Tensor:
+    """Two mono 24kHz float32 clips (~4800 samples) -> two (15,128) float32 CUDA
+    tensors, matching main_continuous_hdf5.py: encode -> quantizer.decode -> (T,128)."""
+    enc = _S["encodec"]
+    
+    def _emb(pcm):
+        x = torch.as_tensor(pcm, dtype=torch.float32, device=_S["device"]).flatten() # converts the input to a float32 tensor on the GPU and flattens it to 1-D. as_tensor avoids a copy if pcm is already a suitable tensor.
+        n = AUDIO_SAMPLES_PER_UNIT # The exact number of samples one unit must contain — ~4800 samples = 200 ms at 24 kHz, matching the 2×100 ms video frames per unit.
+        x = torch.nn.functional.pad(x, (0, n - x.numel())) if x.numel() < n else x[:n] # Forces the clip to exactly n samples: too short → zero-pad on the right (the (0, n - x.numel()) means "0 zeros on the left, the shortfall on the right"); too long → truncate.
+        with torch.inference_mode():
+            # Reshapes to (batch=1, channels=1, samples=n) — the 3-D layout EnCodec expects — and encodes. 
+            # EnCodec internally chunks audio into frames and returns a list of (codes, scale) pairs, where codes has shape (1, K, T): 
+            # K codebooks (residual quantizer levels) × T time steps of discrete token IDs. For a 200 ms clip there's typically just one frame in the list.
+            frames = enc.encode(x.view(1, 1, n))            # [(codes, scale)], codes:(1,K,T)
+            zs = []
+            for code, _scale in frames:
+                z = enc.quantizer.decode(code.transpose(0, 1))   # (1,128,T)  <-- the key step
+                zs.append(z)
+            z = torch.cat(zs, dim=-1).squeeze(0).transpose(0, 1).contiguous()  # (T,128)
+        if z.shape[0] < AUDIO_TOKENS_PER_UNIT:
+            z = torch.nn.functional.pad(z, (0, 0, 0, AUDIO_TOKENS_PER_UNIT - z.shape[0]))
+        return z[:AUDIO_TOKENS_PER_UNIT].float()             # (15,128) stays on GPU
+    
+    return _emb(pcm_hear), _emb(pcm_speak)
+
+ 
+def _assemble_dataframe(u, video: torch.Tensor, key_by_frame: torch.Tensor, mouse_by_frame: dict[int, np.ndarray],  audio_hear :torch.Tensor =None, audio_speak : torch.Tensor=None):
     """Build ONE FullData unit with the exact post-collate shapes:
          video [1,1,2,4,96,160]  mouse [1,1,20,2]  key [1,1,10,16]."""
-    import torch
-    from plaicraft_model.src.data.data_classes import FullData
  
     f0 = u * VIDEO_FRAMES_PER_UNIT
-    # video: 2 consecutive 100ms latents
-    v = torch.from_numpy(video[f0:f0 + VIDEO_FRAMES_PER_UNIT]).float()         # (2,4,96,160)
+    # video: 2 consecutive 100ms latents, (already a float32 CUDA tensor on the GPU)
+    v = video[f0:f0 + VIDEO_FRAMES_PER_UNIT]                                   # (2,4,96,160)
     v = v.reshape(1, 1, VIDEO_FRAMES_PER_UNIT, *VIDEO_LATENT_SHAPE)            # [1,1,2,4,96,160]
  
     # key: 2 frames x (16,5) -> concat on time -> (16,10) -> (10,16) -> [1,1,10,16]
-    kf = [key_by_frame.get(f0 + j, np.zeros((KEY_LATENT_DIM, 5), np.float32))
-          for j in range(VIDEO_FRAMES_PER_UNIT)]
-    k = torch.from_numpy(np.concatenate(kf, axis=1)).float()                  # (16,10)
+    _kzero = torch.zeros((KEY_LATENT_DIM, 5), dtype=torch.float32, device=_S["device"])
+    kf = [key_by_frame.get(f0 + j, _kzero) for j in range(VIDEO_FRAMES_PER_UNIT)]
+    k = torch.cat(kf, dim=1).float()                                          # (16,10)
     k = k.permute(1, 0).reshape(1, 1, KEYBOARD_TOKENS_PER_UNIT, KEY_LATENT_DIM)
  
     # mouse: 2 frames x (2,10) -> concat -> (2,20) -> (20,2) -> [1,1,20,2]
@@ -657,8 +504,9 @@ def _assemble_dataframe(u, video, key_by_frame, mouse_by_frame,  audio_hear=None
     
     def _au(a):
         if a is None:
-            a = np.zeros((AUDIO_TOKENS_PER_UNIT, AUDIO_FEATURE_DIM), np.float32)
-        return torch.from_numpy(a).float().reshape(1, 1, AUDIO_TOKENS_PER_UNIT, AUDIO_FEATURE_DIM)
+            a = torch.zeros((AUDIO_TOKENS_PER_UNIT, AUDIO_FEATURE_DIM),
+                            dtype=torch.float32, device=_S["device"])
+        return a.reshape(1, 1, AUDIO_TOKENS_PER_UNIT, AUDIO_FEATURE_DIM)
     
     batch = {
         "video": v,
@@ -681,33 +529,9 @@ def _decode_prediction(fd):
     mouse_rows: [(time_ms, dx, dy)]."""
     dkl = _S["dkl"]
  
-    # keys: [1,U,10,16] -> per-100ms (16,5) latents -> press intervals -> events
-    kp = fd.key_press
-    if kp is not None:
-        U = kp.shape[1]
-        win = kp[0].reshape(U * VIDEO_FRAMES_PER_UNIT, 5, KEY_LATENT_DIM)
-        # The model stores each window as (latent_seq_len=5, latent_dim=16).
-        # decode_latents_to_activations applies its own .T to get the decoder's
-        # required (16,5), so pass the native (5,16) here (do NOT pre-transpose).
-        latents = win.float().contiguous().cpu().numpy()              # (Nwin,5,16)
-        acts = dkl.decode_latents_to_activations(_S["ae"], latents, device="cpu")
-        bins = dkl.binarize(acts, thresh=dkl.KEY_ON_THRESH)            # (Nwin,79,10)
-        parsed = dkl.parse_events(bins, _S["index_to_name"], _S["mouse_indices"], 0)
-        key_events = parsed["keyboard_events"] + parsed["mouse_button_events"]
-    else:
-        key_events = []
- 
-    # mouse: [1,U,20,2] -> per-100ms (2,10) -> (time_ms, dx, dy) rows
-    mm = fd.mouse_movement
-    mouse_rows = []
-    if mm is not None:
-        U = mm.shape[1]
-        frames = mm[0].reshape(U * VIDEO_FRAMES_PER_UNIT, BINS_PER_FRAME, 2)
-        per_window = [f.float().permute(1, 0).cpu().numpy() for f in frames]   # (2,10)
-        series = dkl.decode_mouse_movement(per_window, mm_stats=None)["series"]
-        mouse_rows = [(s["time_ms"], s["dx"], s["dy"]) for s in series]
- 
-    return key_events, mouse_rows
+    dec = dkl.FullDataDecoder(device="cpu")
+
+    return dec.decode(fd)
  
  
 def _on_sampler_output(fd):
@@ -717,7 +541,6 @@ def _on_sampler_output(fd):
     except Exception:
         print("[live_agent] inject failed:")
         traceback.print_exc()
- 
  
 def _inject(fd):
     key_events, mouse_rows = _decode_prediction(fd)
@@ -748,7 +571,6 @@ def self_check():
     """Build a dummy dataframe and assert it matches the model's expected
     FullData layout. Run this before going live."""
     import torch
-    from plaicraft_model.src.data.data_classes import FullData
     F = 4
     video = np.zeros((F, *VIDEO_LATENT_SHAPE), dtype=np.float32)
     keys = {i: np.zeros((KEY_LATENT_DIM, 5), np.float32) for i in range(F)}

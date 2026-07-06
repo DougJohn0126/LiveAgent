@@ -1,8 +1,0 @@
-deepspeed_flops_estimator:
-  _target_: src.utils.callbacks.deepspeed_flops_estimator.DeepSpeedFlopsEstimator
-  enabled: false
-  start_step: 10
-  every_n_steps: 0
-  max_profiled_steps: 1
-  log_to_progress_bar: true
-  sync_dist: true

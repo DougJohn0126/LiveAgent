@@ -1,50 +1,21 @@
-"""
-minecraft_input_recorder.py
-----------------
-This version captures mouse MOVEMENT from the Windows Raw Input API (WM_INPUT):
-device-level relative deltas, independent of cursor lock/clamping. This is the
-SAME signal Minecraft reads, and the same kind your injector emits with
-pydirectinput.moveRel(relative=True). So record and replay are now symmetric.
-A real half-spin should now show ~1200 px net horizontal travel at 100% sens
-(the recorder prints net dx/dy every flush so you can verify immediately).
- 
-Mouse CLICKS and the KEYBOARD are still captured via pynput — those are not
-affected by cursor grab.
- 
-Output format is (so convert_mouse_movement / inputInjector work as-is):
-  mouse_movement_data.json  [{"timestamp","mouseX","mouseY","mouseDX","mouseDY"}]
-  mouse_click_data.json     [{"timestamp","action"}]
-  keyboard_data.json        [{"timestamp","key","action"}]
- 
-NOTES
------
-* Keep Minecraft's Raw Input setting ON — this recorder matches it.
-* Also turn OFF Windows "Enhance pointer precision" so deltas stay linear.
-* Record and replay on the SAME machine/session with the SAME Minecraft
-  sensitivity, or the pixel->degree mapping won't match.
- 
-Requirements:
-  pip install pynput pywin32
-Usage:
-  python minecraft_input_recorder.py
-  Press Ctrl+C to stop.
-"""
- 
-import ctypes
-import ctypes.wintypes as wt   # importable on Linux too; only the WinDLL/WINFUNCTYPE calls are Windows-only
-import json
 import os
 import sys
 import threading
-import time
-import traceback
 import subprocess
-import signal
-import imageio_ffmpeg
+import time
 import queue
+import imageio_ffmpeg
+import shutil
+import json
 from pathlib import Path
-from pynput import mouse, keyboard
+
 import numpy as np
+import evdev
+from evdev import ecodes
+import selectors
+
+import keycode_mappings
+import live_agent 
  
 # --------------------------------------------------------------------------- #
 # Platform detection — this recorder now runs on Windows AND Linux (X11).
@@ -52,38 +23,26 @@ import numpy as np
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX   = sys.platform.startswith("linux")
  
-if IS_WINDOWS:
-    import win32gui
-elif IS_LINUX:
-    import selectors
-    try:
-        import evdev
-        from evdev import ecodes
-    except Exception:                # python-evdev not installed yet
-        evdev = None
- 
-# The replay/injection side (inputInjector) is a separate, currently
-# Windows-oriented module. Import it lazily so the recorder still runs on
-# Linux even when the injector can't be imported — replay is just skipped.
-"""
-try:
-    #import scripts_replay.inputInjector as inputInjector
-except Exception as _inj_err:
-    inputInjector = None
-    print(f"[warn] inputInjector unavailable ({_inj_err!r}); replay disabled.")
- """
- 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 WINDOW_TITLE    = os.environ.get("PLAICRAFT_WINDOW_TITLE", "Minecraft 1.21.4").lower()
 OUTPUT_DIR      = Path("recordings")
-FLUSH_INTERVAL  = 5      # seconds
-REPLAY_ON_FLUSH = True   # set False to record only (no immediate replay loop)
-WRITE_ON_FLUSH = True
-VIDEO_FPS = 10
-FFMPEG_BIN = "ffmpeg"
- 
+FRAME_QUEUE_MAX = 100
+
+def _ffmpeg_bin():
+    if os.environ.get("FFMPEG_BINARY"):
+        return os.environ["FFMPEG_BINARY"]
+    sys_ff = shutil.which("ffmpeg")     # prefer the system build (has pulse + x11grab)
+    if sys_ff:
+        return sys_ff
+    try:
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+FFMPEG_PATH = _ffmpeg_bin()
+
 # --------------------------------------------------------------------------- #
 # Shared buffers
 # --------------------------------------------------------------------------- #
@@ -91,82 +50,34 @@ _lock = threading.Lock()
 _movement_buf: list[dict] = []
 _click_buf: list[dict] = []
 _keyboard_buf: list[dict] = []
+_hear_buf, _hear_lock = [], threading.Lock()
+_speak_buf, _speak_lock = [], threading.Lock()
+_frame_q = queue.Queue(maxsize=FRAME_QUEUE_MAX)
  
 # Gates all capture. Cleared during replay so we don't (a) re-record the
 # injected motion (Raw Input sees synthetic moves too) or (b) let the blocking
 # replay inflate the next window past FLUSH_INTERVAL.
 _recording = threading.Event()
+
+_stop_video = threading.Event()
  
-# Running virtual position. The OS cursor is frozen under grab, so we integrate
+# Running virtual mouse position. The OS cursor is frozen under grab, so we integrate
 # raw deltas to keep mouseX/mouseY meaningful and continuous.
 _vx = 0.0
 _vy = 0.0
  
+# --------------------------------------------------------------------------- #
+# Deprecated
+# --------------------------------------------------------------------------- #
 _flush_count= 0
 _session_filepath: Path | None = None
- 
  
 def _now_ms() -> int:
     """Current time in milliseconds (matches the sample data format)."""
     return int(time.time() * 1000)
- 
 
- 
-LRESULT = wt.LPARAM  # pointer-sized signed
- 
-WM_INPUT            = 0x00FF
-RID_INPUT           = 0x10000003
-RIDEV_INPUTSINK     = 0x00000100   # receive raw input even when NOT foreground
-RIM_TYPEMOUSE       = 0
-MOUSE_MOVE_ABSOLUTE = 0x01
- 
-HID_USAGE_PAGE_GENERIC  = 0x01
-HID_USAGE_GENERIC_MOUSE = 0x02
- 
- 
-class RAWINPUTDEVICE(ctypes.Structure):
-    _fields_ = [("usUsagePage", wt.USHORT),
-                ("usUsage",     wt.USHORT),
-                ("dwFlags",     wt.DWORD),
-                ("hwndTarget",  wt.HWND)]
- 
- 
-class RAWINPUTHEADER(ctypes.Structure):
-    _fields_ = [("dwType",  wt.DWORD),
-                ("dwSize",  wt.DWORD),
-                ("hDevice", wt.HANDLE),
-                ("wParam",  wt.WPARAM)]
- 
- 
-class _BUTTONS(ctypes.Structure):
-    _fields_ = [("usButtonFlags", wt.USHORT),
-                ("usButtonData",  wt.USHORT)]
- 
- 
-class _MOUSE_U(ctypes.Union):
-    _fields_ = [("ulButtons", wt.ULONG),
-                ("buttons",   _BUTTONS)]
- 
- 
-class RAWMOUSE(ctypes.Structure):
-    _fields_ = [("usFlags",            wt.USHORT),
-                ("u",                  _MOUSE_U),
-                ("ulRawButtons",       wt.ULONG),
-                ("lLastX",             wt.LONG),
-                ("lLastY",             wt.LONG),
-                ("ulExtraInformation", wt.ULONG)]
- 
- 
-class RAWINPUT(ctypes.Structure):
-    _fields_ = [("header", RAWINPUTHEADER),
-                ("mouse",  RAWMOUSE)]
- 
- 
-
- 
-
- 
 def _record_move(dx: int, dy: int, timestamp_ms: int | None = None):
+    """Records mousemovement to the movement buffer"""
     if not _recording.is_set():
         return
     global _vx, _vy
@@ -180,55 +91,8 @@ def _record_move(dx: int, dy: int, timestamp_ms: int | None = None):
             "mouseDX": float(dx),
             "mouseDY": float(dy),
         })
-    print (f"timestamp : { timestamp_ms}")
 
- 
-def _handle_raw_input(hrawinput):
-    size = wt.UINT(0)
-    # 1) query required buffer size (returns 0 on success when pData is NULL)
-    if user32.GetRawInputData(hrawinput, RID_INPUT, None, ctypes.byref(size),
-                              ctypes.sizeof(RAWINPUTHEADER)) != 0:
-        return
-    if size.value == 0:
-        return
-    # 2) read the actual data
-    buf = (ctypes.c_byte * size.value)()
-    got = user32.GetRawInputData(hrawinput, RID_INPUT, buf, ctypes.byref(size),
-                                 ctypes.sizeof(RAWINPUTHEADER))
-    if got != size.value:
-        return
-    raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
-    if raw.header.dwType != RIM_TYPEMOUSE:
-        return
-    # Ignore absolute-mode devices (touchpads / RDP) — we want relative deltas.
-    if raw.mouse.usFlags & MOUSE_MOVE_ABSOLUTE:
-        return
-    dx, dy = raw.mouse.lLastX, raw.mouse.lLastY
-    if dx or dy:
-        _record_move(dx, dy)
- 
- 
-def _wndproc(hwnd, msg, wparam, lparam):
-    if msg == WM_INPUT:
-        _handle_raw_input(lparam)
-    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
- 
- 
- 
-def _raw_input_thread():
-    """Create a hidden window, register for raw mouse input, pump messages."""
 
- 
-# --------------------------------------------------------------------------- #
-# Linux relative-motion capture 
-#
-# Reads EV_REL/REL_X/REL_Y straight from the kernel input layer, i.e.
-# device-level relative deltas independent of pointer acceleration or the
-# cursor grab/clamp — the same kind of signal Raw Input gives on Windows.
-# Requires read access to /dev/input/event* (be in the 'input' group, or run
-# with sudo). Deltas are accumulated per SYN_REPORT to match one hardware
-# report == one _record_move() call.
-# --------------------------------------------------------------------------- #
 def _find_relative_mice():
     """Return evdev devices that emit relative X/Y motion and no keyboard events (real mice)."""
     mice = []
@@ -241,8 +105,17 @@ def _find_relative_mice():
         if ecodes.REL_X in rel and ecodes.REL_Y in rel and ecodes.KEY_A not in rel:
             mice.append(device)
     return mice
- 
- 
+
+# --------------------------------------------------------------------------- #
+# Linux relative-motion capture 
+#
+# Reads EV_REL/REL_X/REL_Y straight from the kernel input layer, i.e.
+# device-level relative deltas independent of pointer acceleration or the
+# cursor grab/clamp.
+# Requires read access to /dev/input/event* (be in the 'input' group, or run
+# with sudo). Deltas are accumulated per SYN_REPORT to match one hardware
+# report == one _record_move() call.
+# --------------------------------------------------------------------------- #
 def _linux_raw_mouse_input_thread():
     """Linux counterpart of _raw_input_thread(): pump evdev relative motion."""
     if evdev is None:
@@ -279,6 +152,7 @@ def _linux_raw_mouse_input_thread():
 
     dx = dy = 0
     tick = 0  # bin index — bin 0 = t=0, bin 1 = t=10, bin 2 = t=20, ...
+    start_ms = _now_ms()
     start_mono = time.monotonic()
     next_emit_mono = start_mono + REPORT_INTERVAL
 
@@ -286,7 +160,7 @@ def _linux_raw_mouse_input_thread():
         timeout = next_emit_mono - time.monotonic()
         if timeout < 0:
             timeout = 0
-        # calling from the selector engine allows the process to sleep during moments when it is
+        # calling from the selector engine allows the process to sleep during moments when there is no mouse movement
         events_ready = sel.select(timeout=timeout)
 
         for key, _mask in events_ready:
@@ -309,7 +183,7 @@ def _linux_raw_mouse_input_thread():
         now = time.monotonic()
         if now >= next_emit_mono:
             tick += 1
-            _record_move(dx, dy, timestamp_ms=tick * REPORT_INTERVAL_MS)
+            _record_move(dx, dy, timestamp_ms= int (start_ms + tick * REPORT_INTERVAL_MS))
             dx = dy = 0
 
             next_emit_mono += REPORT_INTERVAL
@@ -320,8 +194,9 @@ def _linux_raw_mouse_input_thread():
                 tick += missed
                 next_emit_mono += missed * REPORT_INTERVAL
 
+
 def _find_keyclick_devices():
-    """Devices that emit EV_KEY (keyboards + mice with buttons)."""
+    """Return devices that emit EV_KEY (keyboards + mice with buttons)."""
     devs = []
     for path in evdev.list_devices():
         try:
@@ -332,49 +207,16 @@ def _find_keyclick_devices():
             devs.append(dev)
     return devs
 
-_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-_DIGITS = "0123456789"
-# A dictionary of key to unicode mappings
-_CHAR = {}
-if evdev is not None:
-    for _c in _LETTERS:
-        _CHAR[getattr(ecodes, f"KEY_{_c}")] = ord(_c)
-    for _d in _DIGITS:
-        _CHAR[getattr(ecodes, f"KEY_{_d}")] = ord(_d)
-_GLFW_SPECIAL = {
-    ecodes.KEY_SPACE: 32, ecodes.KEY_ENTER: 257, ecodes.KEY_TAB: 258,
-    ecodes.KEY_BACKSPACE: 259, ecodes.KEY_INSERT: 260, ecodes.KEY_DELETE: 261,
-    ecodes.KEY_RIGHT: 262, ecodes.KEY_LEFT: 263, ecodes.KEY_DOWN: 264,
-    ecodes.KEY_UP: 265, ecodes.KEY_PAGEUP: 266, ecodes.KEY_PAGEDOWN: 267,
-    ecodes.KEY_HOME: 268, ecodes.KEY_END: 269, ecodes.KEY_CAPSLOCK: 280,
-    ecodes.KEY_SCROLLLOCK: 281, ecodes.KEY_NUMLOCK: 282, ecodes.KEY_SYSRQ: 283,
-    ecodes.KEY_PAUSE: 284, ecodes.KEY_F1: 290, ecodes.KEY_F2: 291,
-    ecodes.KEY_F3: 292, ecodes.KEY_F4: 293, ecodes.KEY_F5: 294, ecodes.KEY_F6: 295,
-    ecodes.KEY_F7: 296, ecodes.KEY_F8: 297, ecodes.KEY_F9: 298, ecodes.KEY_F10: 299,
-    ecodes.KEY_F11: 300, ecodes.KEY_F12: 301, ecodes.KEY_LEFTSHIFT: 340,
-    ecodes.KEY_RIGHTSHIFT: 344, ecodes.KEY_LEFTCTRL: 341, ecodes.KEY_RIGHTCTRL: 345,
-    ecodes.KEY_LEFTALT: 342, ecodes.KEY_RIGHTALT: 346, ecodes.KEY_ESC: 256,
-} if evdev is not None else {}
-
-_CLICK_BTN = {
-    ecodes.BTN_LEFT:   "LEFT",
-    ecodes.BTN_RIGHT:  "RIGHT",
-    ecodes.BTN_MIDDLE: "MIDDLE",
-} if evdev is not None else {}
-
-
-def _glfw_code(keycode):
-    if keycode in _GLFW_SPECIAL:
-        return _GLFW_SPECIAL[keycode]
-    if keycode in _CHAR:
-        return _CHAR[keycode]
-    return -1   # unmapped; matches _key_code's fallback
-
-
-
-
+# --------------------------------------------------------------------------- #
+# Linux key/click capture 
+#
+# Reads key/click inputs straight from the kernel input layer.
+# Requires read access to /dev/input/event* (be in the 'input' group, or run
+# with sudo). Deltas are accumulated per SYN_REPORT to match one hardware
+# report == one _record_move() call.
+# --------------------------------------------------------------------------- #
 def _linux_raw_key_click_input_thread():
-    
+    """Linux counterpart of _raw_click_thread(): pump evdev key presses/releases."""
     if evdev is None:
         print("[linux] python-evdev not installed — mouse MOVEMENT will not be "
               "captured. Install it with:  pip install evdev")
@@ -394,38 +236,34 @@ def _linux_raw_key_click_input_thread():
     print(f"[evdev_keys] capturing keys/clicks from: {', '.join(d.name for d in devices)}")
 
     sel = selectors.DefaultSelector()
-    for dev in devices:
+    for device in devices:
         try:
-            sel.register(dev, selectors.EVENT_READ)
+            sel.register(device, selectors.EVENT_READ)
         except Exception:
             pass
 
     while True:
-        # calling from the selector engine allows the process to sleep during moments when it is
+        # calling from the selector engine allows the process to sleep during moments when keys are not pressed
         for key, _mask in sel.select():
             dev = key.fileobj
             try:
                 for ev in dev.read():
+                    # ev.type must equal EV_KEY
                     if ev.type != ecodes.EV_KEY:
                         continue
                     # value: 1=down, 0=up, 2=autorepeat (ignore repeats)
                     if ev.value == 2:
                         continue
                     ts = _now_ms()
-                    if ev.code in _CLICK_BTN:                      # mouse button -> click_buf
-                        lbl = _CLICK_BTN[ev.code]
+                    if ev.code in keycode_mappings.CLICK_BTN:   # mouse button -> click_buf
+                        lbl = keycode_mappings.CLICK_BTN[ev.code]
                         act = f"{lbl}_PRESS" if ev.value == 1 else f"{lbl}_RELEASE"
                         with _lock:
                             _click_buf.append({"timestamp": ts, "action": act})
-
-                            print (f"timestamp {ts} : action {act}")
-                    else:                                    # keyboard -> keyboard_buf
+                    else:                       # keyboard -> keyboard_buf
                         act = "PRESS" if ev.value == 1 else "RELEASE"
                         with _lock:
-                            _keyboard_buf.append({"timestamp": ts,
-                                                      "key": _glfw_code(ev.code),
-                                                      "action": act})
-                            print (f"timestamp {ts} : key: {_glfw_code(ev.code)} : action {act}")
+                            _keyboard_buf.append({"timestamp": ts, "key": keycode_mappings.glfw_code(ev.code), "action": act})
             except BlockingIOError:
                 pass
             except OSError:
@@ -434,8 +272,9 @@ def _linux_raw_key_click_input_thread():
                 except Exception:
                     pass
  
- # ----------------------------------------------------------------------------- #
-# Config (capture-side only; model/sampler config comes from live_agent's env)
+
+# ----------------------------------------------------------------------------- #
+# Cideo config (capture-side only; model/sampler config comes from live_agent's env)
 # ----------------------------------------------------------------------------- #
 LATENT_FPS       = int(os.environ.get("PLAICRAFT_FPS", "10"))
 FRAMES_PER_UNIT  = 2
@@ -445,31 +284,31 @@ FRAME_BYTES      = GRAB_WH[0] * GRAB_WH[1] * 3
 QUEUE_MAX        = 100
 UNIT_MS          = FRAMES_PER_UNIT * (1000 // LATENT_FPS)                 # 200
 
-
 # Video and audio come off separate ffmpeg pipes with different buffering lag, so
 # they need *independent* time-offset corrections (the old single FRAME_LATENCY_MS
 # was wrong for audio). Tune each by watching an obvious action vs its frame/sound.
 FRAME_LATENCY_MS = int(os.environ.get("PLAICRAFT_FRAME_LATENCY_MS", "100"))
 AUDIO_LATENCY_MS = int(os.environ.get("PLAICRAFT_AUDIO_LATENCY_MS", "100"))
 
-VIDEO_BACKEND = os.environ.get("PLAICRAFT_VIDEO_BACKEND", "x11grab").lower()
 HEAR_DEVICE   = os.environ.get("PLAICRAFT_AUDIO_HEAR_DEVICE", "")   # sink .monitor
 SPEAK_DEVICE  = os.environ.get("PLAICRAFT_AUDIO_SPEAK_DEVICE", "")  # mic source
 
-_stop = threading.Event()
-_frame_q = queue.Queue(maxsize=QUEUE_MAX)
-
-
-
+# --------------------------------------------------------------------------- #
+# Linux video capture 
+#
+# Reads pixel coordinates given a dimension and coordinates (region) using ffmpeg 
+# and pumps the raw uncompressed BGR frames/pixel data to std.out which later gets 
+# transformed to frames.
+# --------------------------------------------------------------------------- #
 def _linux_raw_video_input_thread():
-    import subprocess
+    """Pumps raw pixel data from ffmpeg to std.out and reads one frame's worth of data
+      at a time to form a frame which gets pushed onto a thread safe queue."""
     region = _resolve_region();
     proc = subprocess.Popen(_video_cmd(region), stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, bufsize=FRAME_BYTES)
     print("[capture] video grabber started (x11grab / XWayland).", flush=True)
     try:
-        x = 0
-        while not _stop.is_set():
+        while not _stop_video.is_set():
             raw = _read_exact(proc.stdout, FRAME_BYTES)
             if raw is None:
                 print("[capture] video pipe ended — wrong DISPLAY/region, or the "
@@ -479,26 +318,21 @@ def _linux_raw_video_input_thread():
             t = _now_ms()
             frame = np.frombuffer(raw, np.uint8).reshape(GRAB_WH[1], GRAB_WH[0], 3)
             try:
-                x += 1
                 _frame_q.put_nowait((t, frame))
-                if (x % 10 == 0):
-                    for item in list(_frame_q.queue):
-                        print(item[0])
             except queue.Full:                 # stay current: drop oldest
                 try:
                     _frame_q.get_nowait()
                     _frame_q.put_nowait((t, frame))
                 except queue.Empty:
                     pass
-
     finally:
         try:
-            print ("asdf")
             proc.kill()
         except Exception:
             pass
 
-def measure(seconds=10):
+# test function for measuring fps capable by ffmpeg
+def _measure(seconds=10):
     region = _resolve_region()
     proc = subprocess.Popen(_video_cmd(region), stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, bufsize=FRAME_BYTES * 8)
@@ -515,24 +349,8 @@ def measure(seconds=10):
     proc.kill()
     print(f"final: {n / (time.time() - t0):.1f} fps over {seconds}s")
 
-
-
-
-def _ffmpeg_bin():
-    if os.environ.get("FFMPEG_BINARY"):
-        return os.environ["FFMPEG_BINARY"]
-    import shutil
-    sys_ff = shutil.which("ffmpeg")     # prefer the system build (has pulse + x11grab)
-    if sys_ff:
-        return sys_ff
-    try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        return "ffmpeg"
-
-
 def _read_exact(stream, n):
+    """ Read the from the steam of bytes exactly one frame's (n) worth of bytes"""
     buf = bytearray()
     while len(buf) < n:
         chunk = stream.read(n - len(buf))
@@ -541,17 +359,12 @@ def _read_exact(stream, n):
         buf.extend(chunk)
     return bytes(buf)
 
-
-
-# ----------------------------------------------------------------------------- #
-# Region resolution: env override -> recorder's window finder -> full-ish default
-# ----------------------------------------------------------------------------- #
 def _resolve_region():
+    """Region resolution: env override -> recorder's window finder -> full-ish default"""
     try:
         win = find_window(WINDOW_TITLE)
         print(f"[capture] found window '{win['title']}")
-        if win:
-            
+        if win:   
             try:
                 moved = focus_window(win["hwnd"])
                 if moved:
@@ -570,23 +383,20 @@ def _resolve_region():
     return (0, 0, 1280, 720)
 
 
-# ----------------------------------------------------------------------------- #
-# Video capture -> raw BGR frames on a queue (no JPEG; in-process feeds the VAE
-# directly). x11grab works under XWayland; portal stub for native Wayland.
-# ----------------------------------------------------------------------------- #
 def _video_cmd(region):
+    """Video capture -> raw BGR frames on a queue (no JPEG). \n
+    x11grab works under XWayland; portal stub for native Wayland."""
     left, top, w, h = region
     w -= w % 2
     h -= h % 2
     out = ["-r", str(LATENT_FPS),
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     display = os.environ.get("DISPLAY", ":0")
-    return [_ffmpeg_bin(), "-hide_banner", "-loglevel", "error",
+    return [FFMPEG_PATH, "-hide_banner", "-loglevel", "error",
             "-f", "x11grab", "-framerate", str(LATENT_FPS),
             "-video_size", f"{w}x{h}", "-i", f"{display}+{left},{top}", *out]
 
-
-
+# test function for video capture
 def _video_cmd_test(region):
     left, top, w, h = region
     w -= w % 2
@@ -595,328 +405,21 @@ def _video_cmd_test(region):
            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", "output.mp4"]
     display = os.environ.get("DISPLAY", ":0")
     print (display)
-    return [_ffmpeg_bin(), "-hide_banner", "-loglevel", "error",
+    return [FFMPEG_PATH, "-hide_banner", "-loglevel", "error",
             "-f", "x11grab", "-framerate", str(LATENT_FPS),
             "-video_size", f"{w}x{h}", "-i", f"{display}+{left},{top}", *out]
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --------------------------------------------------------------------------- #
-# Mouse click listener (pynput — unaffected by cursor grab)
-# --------------------------------------------------------------------------- #
-_BUTTON_MAP = {
-    mouse.Button.left:   "LEFT",
-    mouse.Button.right:  "RIGHT",
-    mouse.Button.middle: "MIDDLE",
-}
+# --- Platform video dispatchers --------------------------------------------------- #
+def find_window(sub):
+    if IS_LINUX:
+        return _linux_find_window(sub)
+    return None
  
+def focus_window(hwnd):
+    if IS_LINUX:
+        return _linux_focus_window(hwnd)
  
-def on_click(x: float, y: float, button: mouse.Button, pressed: bool):
-    if not _recording.is_set():
-        return
-    label  = _BUTTON_MAP.get(button, button.name.upper())
-    action = f"{label}_PRESS" if pressed else f"{label}_RELEASE"
-    with _lock:
-        _click_buf.append({"timestamp": _now_ms(), "action": action})
- 
- 
-# --------------------------------------------------------------------------- #
-# Keyboard listener (pynput)
-# --------------------------------------------------------------------------- #
-def _key_code(key) -> int:
-    """Numeric key code matching GLFW / Minecraft values."""
-    _SPECIAL = {
-        keyboard.Key.space: 32, keyboard.Key.enter: 257, keyboard.Key.tab: 258,
-        keyboard.Key.backspace: 259, keyboard.Key.insert: 260,
-        keyboard.Key.delete: 261, keyboard.Key.right: 262, keyboard.Key.left: 263,
-        keyboard.Key.down: 264, keyboard.Key.up: 265, keyboard.Key.page_up: 266,
-        keyboard.Key.page_down: 267, keyboard.Key.home: 268, keyboard.Key.end: 269,
-        keyboard.Key.caps_lock: 280, keyboard.Key.scroll_lock: 281,
-        keyboard.Key.num_lock: 282, keyboard.Key.print_screen: 283,
-        keyboard.Key.pause: 284, keyboard.Key.f1: 290, keyboard.Key.f2: 291,
-        keyboard.Key.f3: 292, keyboard.Key.f4: 293, keyboard.Key.f5: 294,
-        keyboard.Key.f6: 295, keyboard.Key.f7: 296, keyboard.Key.f8: 297,
-        keyboard.Key.f9: 298, keyboard.Key.f10: 299, keyboard.Key.f11: 300,
-        keyboard.Key.f12: 301, keyboard.Key.shift: 340, keyboard.Key.shift_r: 344,
-        keyboard.Key.ctrl: 341, keyboard.Key.ctrl_r: 345, keyboard.Key.alt: 342,
-        keyboard.Key.alt_r: 346, keyboard.Key.esc: 256,
-    }
-    if isinstance(key, keyboard.Key):
-        return _SPECIAL.get(key, -1)
-    if getattr(key, "char", None) is not None:
-        return ord(key.char.upper())
-    if getattr(key, "vk", None) is not None:
-        return key.vk
-    return -1
- 
- 
-def on_press(key):
-    if not _recording.is_set():
-        return
-    with _lock:
-        _keyboard_buf.append({"timestamp": _now_ms(),
-                              "key": _key_code(key), "action": "PRESS"})
- 
- 
-def on_release(key):
-    if not _recording.is_set():
-        return
-    with _lock:
-        _keyboard_buf.append({"timestamp": _now_ms(),
-                              "key": _key_code(key), "action": "RELEASE"})
-        
-# --------------------------------------------------------------------------- #
-# Recorder
-# --------------------------------------------------------------------------- #
-class ScreenRecorder:
-    """Records a fixed screen region to a single .mkv via ffmpeg (Windows gdigrab).
- 
-    start(path) spawns ffmpeg; stop() finalizes that clip and returns its path.
-    Designed to be driven once per FLUSH_INTERVAL window so each clip lines up
-    1:1 with the JSON for that window.
-    """
- 
-    def __init__(self, region: tuple[int, int, int, int], fps: int, ffmpeg_bin: str = "ffmpeg"):
-        left, top, width, height = region
-        # libx264 + yuv420p needs even dimensions.
-        self.left = int(left)
-        self.top = int(top)
-        self.width = int(width) - (int(width) % 2)
-        self.height = int(height) - (int(height) % 2)
-        self.fps = fps
-        self.ffmpeg = ffmpeg_bin   # resolved absolute path (or "ffmpeg" if on PATH)
-        self._proc: subprocess.Popen | None = None
-        self._path: Path | None = None
- 
-    def _cmd(self, out_path):
-        # Prefer an explicit binary (FFMPEG_BINARY env) so users can point at a
-        # system ffmpeg if the bundled one lacks the needed grabber.
-        ffmpeg = os.environ.get("FFMPEG_BINARY") or imageio_ffmpeg.get_ffmpeg_exe()
- 
-        out_opts = [
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-            "-g", str(self.fps),
-            str(out_path),
-        ]
- 
-        if IS_WINDOWS:
-            return [
-                ffmpeg,
-                "-hide_banner", "-loglevel", "warning", "-y",
-                "-f", "gdigrab",
-                "-framerate", str(self.fps),
-                "-offset_x", str(self.left),
-                "-offset_y", str(self.top),
-                "-video_size", f"{self.width}x{self.height}",
-                "-i", "desktop",
-                *out_opts,
-            ]
- 
-        # Linux / X11: grab a region of the X display starting at (left, top).
-        # NOTE: requires an X11 (or XWayland) session; pure Wayland needs
-        # kmsgrab/pipewire instead. If you hit "Unknown input format 'x11grab'",
-        # install a full ffmpeg (sudo apt install ffmpeg) and set
-        # FFMPEG_BINARY=/usr/bin/ffmpeg.
-        display = os.environ.get("DISPLAY", ":0.0")
-        return [
-            ffmpeg,
-            "-hide_banner", "-loglevel", "warning", "-y",
-            "-f", "x11grab",
-            "-framerate", str(self.fps),
-            "-video_size", f"{self.width}x{self.height}",
-            "-i", f"{display}+{self.left},{self.top}",
-            *out_opts,
-        ]
- 
-    def start(self, out_path):
-        self._path = out_path  
-        cmd = self._cmd(out_path)
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
- 
-    def stop(self) -> Path | None:
-        """Finalize the current clip cleanly and return its path."""
-        proc, path = self._proc, self._path
-        self._proc, self._path = None, None
-        if proc is None:
-            return None
-        try:
-            if proc.stdin:
-                proc.stdin.write(b"q")   # graceful flush -> valid moov/index
-                proc.stdin.flush()
-                proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            try:
-                proc.send_signal(signal.SIGINT)
-            except Exception:
-                pass
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        return path
- 
- 
-# --------------------------------------------------------------------------- #
-# Periodic flush to disk (+ optional immediate replay)
-# --------------------------------------------------------------------------- #
-def _write_json(path: Path, data: list[dict]):
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=None, separators=(",\n", ":"))
-    tmp.replace(path)  # atomic rename
- 
- 
-def _send_to_injector(mousedata: str, clickdata: str, keydata: str, videopath: Path):
-    if inputInjector is None:
-        return
-    try:
-        inputInjector.replay(mousedata, clickdata, keydata, videopath)
-    except Exception as e:
-        print(traceback.print_exc() )
- 
- 
-def _flush():
-    global _flush_count
- 
-    with _lock: 
-        movement_snapshot = _movement_buf.copy()
-        click_snapshot    = _click_buf.copy()
-        keyboard_snapshot = _keyboard_buf.copy()
-        _movement_buf.clear()
-        _click_buf.clear()
-        _keyboard_buf.clear()
- 
-    if (WRITE_ON_FLUSH):
-        _write_json(_session_filepath / f"mouse_movement_data_{_flush_count}.json", movement_snapshot)
-        _write_json(_session_filepath / f"mouse_click_data_{_flush_count}.json",    click_snapshot)
-        _write_json(_session_filepath / f"keyboard_data_{_flush_count}.json",       keyboard_snapshot)
- 
-    """
-    # Sanity readout: a real 180° spin should be ~1200 px net dx at 100% sens.
-    net_dx = sum(e["mouseDX"] for e in movement_snapshot)
-    net_dy = sum(e["mouseDY"] for e in movement_snapshot)
-    ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}] Flushed — {len(movement_snapshot)} moves "
-          f"(net dx={net_dx:.0f}px dy={net_dy:.0f}px), "
-          f"{len(click_snapshot)} clicks, {len(keyboard_snapshot)} keys")
-    """
-    _flush_count += 1
- 
-    return movement_snapshot, click_snapshot, keyboard_snapshot
- 
- 
-def _record_loop(screen: "ScreenRecorder | None"):
-    """Record for exactly FLUSH_INTERVAL, then flush, then optionally replay.
- 
-    Recording is PAUSED around the flush + replay, so:
-      * the recorder never captures the injected replay motion (no feedback), and
-      * the blocking replay (inputInjector joins its thread) can't push events
-        into the next window — every window is bounded to FLUSH_INTERVAL.
-    """
-    global _vx, _vy
-    global _flush_count
-    global _session_filepath
-    while True:
-        # ---- RECORD phase: exactly FLUSH_INTERVAL of capture ----
-        with _lock:
-            _movement_buf.clear()
-            _click_buf.clear()
-            _keyboard_buf.clear()
-        
-        if screen is not None and _session_filepath is not None:
-            screen.start(_session_filepath / f"clip_{_flush_count}.mkv")
-        
-        _recording.set()
-        _record_move(0,0)              # flush starting 0,0
-        time.sleep(FLUSH_INTERVAL)
-        _record_move(0,0)              # flush ending 0,0
-        _recording.clear()            # pause before snapshot + replay
- 
-        # ---- stop video for this window (clip now aligns with the JSON) ----
-        clip_path = screen.stop() if screen is not None else None
-        print(screen)
- 
-        print(clip_path)
- 
-        # ---- FLUSH ----
-        mv, ck, kb = _flush()
- 
-        # ---- REPLAY phase (recording paused -> no feedback, no inflation) ----
-        if REPLAY_ON_FLUSH:
-            _send_to_injector(json.dumps(mv), json.dumps(ck), json.dumps(kb), clip_path)
- 
- 
-# --------------------------------------------------------------------------- #
-# Window helpers
-# --------------------------------------------------------------------------- #
-def _win_find_window(sub):
-    found = {}
- 
-    def cb(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd):
-            t = win32gui.GetWindowText(hwnd)
-            if sub.lower() in t.lower():
-                r = win32gui.GetWindowRect(hwnd)
-                found.update(hwnd=hwnd, title=t, left=r[0], top=r[1],
-                             width=r[2] - r[0], height=r[3] - r[1])
- 
-    win32gui.EnumWindows(cb, None)
-    return found or None
- 
- 
-def _win_focus_window(hwnd):
-    try:
-        if win32gui.GetForegroundWindow() != hwnd:
-            win32gui.SetForegroundWindow(hwnd)
-    except Exception:
-        pass
- 
- 
-# --- Linux (X11) window helpers, via wmctrl + xwininfo ---------------------- #
+# Linux (X11) window helpers, via wmctrl + xwininfo ---------------------- #
 def _xwininfo_geometry(wid):
     """Absolute on-screen geometry for an X11 window id, via xwininfo."""
     try:
@@ -941,7 +444,6 @@ def _xwininfo_geometry(wid):
         return info
     return None
  
- 
 def _linux_find_window(sub):
     try:
         out = subprocess.check_output(["wmctrl", "-l"], text=True)
@@ -964,7 +466,6 @@ def _linux_find_window(sub):
             print (parts)
             return {"hwnd": wid, "title": title, **geo}
     return None
- 
  
 def _linux_focus_window(wid, x=100, y=100, width=1280, height=720):
     for cmd in (["wmctrl", "-i", "-a", str(wid)],
@@ -996,28 +497,142 @@ def _linux_focus_window(wid, x=100, y=100, width=1280, height=720):
     except FileNotFoundError:
         print("xdotool is not installed. Run: sudo apt install xdotool")
         return False
- 
- 
-# --- Platform dispatchers --------------------------------------------------- #
-def find_window(sub):
-    if IS_WINDOWS:
-        return _win_find_window(sub)
-    if IS_LINUX:
-        return _linux_find_window(sub)
-    return None
- 
- 
-def focus_window(hwnd):
-    if IS_WINDOWS:
-        return _win_focus_window(hwnd)
-    if IS_LINUX:
-        return _linux_focus_window(hwnd)
- 
- 
+
+
+AUDIO_SR               = int(getattr(live_agent, "AUDIO_SR", 24000))
+AUDIO_SAMPLES_PER_UNIT = int(getattr(live_agent, "AUDIO_SAMPLES_PER_UNIT", AUDIO_SR // 5))
+
+def _pactl(*args):
+    """Run `pactl <args>` and return stripped stdout, or '' on any failure. \n
+        pactl is a command-line utility used to control the PulseAudio sound server. \n
+        It provides a scriptable interface for managing audio devices (sinks/sources), \n
+        volume levels, active streams, and loaded modules.
+    """
+    if not shutil.which("pactl"):
+        return ""
+    try:
+        return subprocess.run(["pactl", *args],
+                              capture_output=True, text=True, timeout=3).stdout.strip()
+    except Exception:
+        return ""
+
+def _default_source():
+    """Returns he default capture source — the mic."""
+    src = _pactl("get-default-source")
+    if src:
+        return src
+    info = _pactl("info")
+    for line in info.splitlines():
+        if line.lower().startswith("default source:"):
+            return line.split(":", 1)[1].strip()
+    print("[capture] PLAICRAFT_AUDIO_SPEAK_DEVICE unset — silence for audio_speak")
+    return ""
+
+def _default_monitor():
+    """Returns the .monitor source for the default sink — the Minecraft window"""
+    sink = _pactl("get-default-sink")
+    if sink:
+        return f"{sink}.monitor"
+    # older pactl without get-default-sink: parse `info`
+    info = _pactl("info")
+    for line in info.splitlines():
+        if line.lower().startswith("default sink:"):
+            return line.split(":", 1)[1].strip() + ".monitor"
+    print("[capture] PLAICRAFT_AUDIO_HEAR_DEVICE unset — silence for audio_hear")
+    return ""
+
+# ----------------------------------------------------------------------------- #
+# Linux audio capture (PipeWire/Pulse) -> rolling timestamped buffers
+#    -f pulse -i source — input is the pulse audio device named source (a sink .monitor for "hear," or a mic source for "speak" — the HEAR_DEVICE/SPEAK_DEVICE from config).
+#    -ac 1 — downmix to 1 channel (mono).
+#    -ar str(AUDIO_SR) — resample to 24 kHz, matching what the model expects.
+#    -f f32le — output format 32-bit little-endian float PCM (raw samples in [-1, 1]).
+# ----------------------------------------------------------------------------- #
+def _linux_raw_audio_input_thread(label):
+    if (label == "speak"):
+        buf = _hear_buf
+        lock = _hear_lock
+        src = _default_source()
+    else:
+        buf = _speak_buf
+        lock = _speak_lock
+        src = _default_monitor()
+
+    cmd = [FFMPEG_PATH, "-hide_banner", "-loglevel", "error",
+           "-f", "pulse", "-i", src,
+           "-ac", "1", "-ar", str(AUDIO_SR), "-f", "f32le", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None)
+    print(f"[capture] audio '{label}' started from pulse source: {src}", flush=True)
+    CHUNK = AUDIO_SR // 50  # 20 ms of audio per read
+    try:
+        while not _stop_video.is_set():
+            raw = _read_exact(proc.stdout, CHUNK * 4)   # float32 = 4 bytes
+            if raw is None:
+                print(f"[capture] audio '{label}' pipe ended — bad pulse source name? "
+                      f"check `pactl list sources short`", flush=True)
+                break
+            t = _now_ms()
+            c = np.frombuffer(raw, np.float32).copy()
+            with lock:
+                buf.append((t, c))
+                cutoff = t - 2000
+                while buf and buf[0][0] < cutoff:
+                    buf.pop(0)
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def start_recording():
+    """
+     Start input capture (continuous). On Wayland ALL of it must come from evdev:
+       - mouse MOTION  -> rec._linux_raw_input_thread (REL_X/REL_Y)
+       - keys + clicks -> evdev_keys (EV_KEY) 
+       - pynput is X11-only and goes silent on Wayland, which would feed the model zero key context (degenerate).
+    """
+    threading.Thread(target=_linux_raw_key_click_input_thread, daemon=True).start()
+    threading.Thread(target=_linux_raw_mouse_input_thread, daemon=True).start()
+    threading.Thread(target=_linux_raw_video_input_thread, daemon=True).start()
+    threading.Thread(target=_linux_raw_audio_input_thread, args=("speak",),daemon=True).start()
+    threading.Thread(target=_linux_raw_audio_input_thread, args=("hear",),daemon=True).start()
+
+  
 # --------------------------------------------------------------------------- #
-# Main
+# Periodic flush to disk + optional immediate replay (not used for current pipeline)
+# --------------------------------------------------------------------------- #
+def _flush(is_write_on_flush: bool):
+    global _flush_count
+ 
+    with _lock: 
+        movement_snapshot = _movement_buf.copy()
+        click_snapshot    = _click_buf.copy()
+        keyboard_snapshot = _keyboard_buf.copy()
+        _movement_buf.clear()
+        _click_buf.clear()
+        _keyboard_buf.clear()
+ 
+    if (is_write_on_flush):
+        _write_json(_session_filepath / f"mouse_movement_data_{_flush_count}.json", movement_snapshot)
+        _write_json(_session_filepath / f"mouse_click_data_{_flush_count}.json",    click_snapshot)
+        _write_json(_session_filepath / f"keyboard_data_{_flush_count}.json",       keyboard_snapshot)
+ 
+    _flush_count += 1
+ 
+    return movement_snapshot, click_snapshot, keyboard_snapshot
+
+def _write_json(path: Path, data: list[dict]):
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=None, separators=(",\n", ":"))
+    tmp.replace(path)  # atomic rename
+# --------------------------------------------------------------------------- #
+# Main (not used for current pipeline)
 # --------------------------------------------------------------------------- #
 def main():
+    FLUSH_INTERVAL  = 5      # seconds
+    WRITE_ON_FLUSH = True
     print("Minecraft Input Repeater (Raw Input)")
     print(f"  Flush every : {FLUSH_INTERVAL}s")
     print("  Keep Minecraft 'Raw Input' = ON. Press Ctrl+C to stop.\n")
@@ -1037,40 +652,20 @@ def main():
         _session_filepath.mkdir(parents=True, exist_ok=True)
         print(f"  Output dir  : {OUTPUT_DIR.resolve()}")
  
-    # Build the screen recorder from the window's rect (captured once).
-    screen = None
-    screen = ScreenRecorder(
-        region=(win["left"], win["top"], win["width"], win["height"]),
-        fps=VIDEO_FPS,
-    )
+    _recording.set()
+    start_recording()
     
-    # Clicks + keyboard via pynput.
-    click_listener    = mouse.Listener(on_click=on_click)
-    keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    click_listener.start()
-    keyboard_listener.start()
- 
-    # Mouse-movement capture thread (device-level relative deltas).
-    if IS_WINDOWS:
-        # Raw Input: creates its own hidden window + message loop.
-        print ("windows not supported anymore")
-    elif IS_LINUX:
-        # evdev: reads relative motion straight from /dev/input.
-        threading.Thread(target=_linux_raw_input_thread, daemon=True).start()
     # Record / flush / replay cycle thread.
-    threading.Thread(target=_record_loop, args=(screen,), daemon=True).start()
+    #threading.Thread(target=_record_loop, args=(screen,), daemon=True).start()
  
     try:
         while True:
             time.sleep(0.5)
     except KeyboardInterrupt:
         print("\nStopping — flushing final events …")
-        if screen is not None:
-            screen.stop()          # finalize any in-progress clip
         _flush()
         print("Done.")
  
  
 if __name__ == "__main__":
     main()
- 

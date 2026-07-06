@@ -1,6 +1,0 @@
-defaults: # Inherit base trainer config
-  - default # Base trainer settings
-
-strategy: ddp_find_unused_parameters_true # Distributed data parallel strategy
-
-sync_batchnorm: True # Sync batch norm across devices

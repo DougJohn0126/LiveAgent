@@ -1,9 +1,0 @@
-_target_: src.data.datamodule.DataModule
-
-# Semantic evaluation dataset parameters
-dataset_path: ${oc.env:DATASET_PATH}
-evaluation_metadata_db_path: ${paths.evaluation_metadata_db_path}
-
-# Loading
-batch_size: 1
-num_workers: 1

@@ -1,8 +1,0 @@
-defaults: # Inherit base trainer config
-  - default # Base trainer settings
-
-# simulate DDP on CPU, useful for debugging
-accelerator: cpu # CPU accelerator
-devices: 2 # CPU device count
-strategy: ddp_spawn # DDP spawn strategy
-precision: 32  # CPU doesn't support mixed precision well

@@ -1,9 +1,0 @@
-# @package _global_
-
-# runs 1 train, 1 validation and 1 test step
-
-defaults: # Inherit base debug config
-  - default # Base debug settings
-
-trainer: # Trainer override for fast dev run
-  fast_dev_run: true # Run a single batch through all loops
